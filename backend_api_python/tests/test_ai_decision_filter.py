@@ -228,7 +228,45 @@ def test_calibrated_jev_confidence_accepts_clear_entry(monkeypatch):
     assert result.decision == "pass"
 
 
-def test_malformed_jev_answer_falls_back_to_llm(monkeypatch):
+def test_openrouter_jev_uses_typed_decisions_endpoint(monkeypatch):
+    captured = {}
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"answers": _jev_answers()}
+
+    monkeypatch.setattr(module.AIDecisionFilter, "_jev_config", staticmethod(lambda: {
+        "api_key": "secret",
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "~typesafe/jev-latest",
+        "transport": "auto",
+        "timeout_seconds": "8",
+        "min_confidence": "0.55",
+    }))
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return Response()
+
+    monkeypatch.setattr(module.requests, "post", fake_post)
+    monkeypatch.setattr(module.AIDecisionFilter, "_persist", staticmethod(lambda request, result: None))
+
+    result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
+
+    assert result.allowed is True
+    assert result.provider == "jev"
+    assert captured["url"] == "https://openrouter.ai/api/alpha/decisions"
+    assert captured["json"]["model"] == "~typesafe/jev-latest"
+    assert captured["json"]["provider"] == {"allow_fallbacks": False}
+    assert captured["json"]["state"]["symbol"] == "BTC/USDT"
+    assert set(captured["json"]["questions"]) == set(module.JEV_QUESTIONS)
+
+
+def test_malformed_jev_answer_blocks_entry_without_llm_fallback(monkeypatch):
     class Response:
         def raise_for_status(self):
             return None
@@ -245,14 +283,8 @@ def test_malformed_jev_answer_falls_back_to_llm(monkeypatch):
             }
 
     class LLM:
-        def is_configured(self):
-            return True
-
-        def get_default_model(self):
-            return "fallback-model"
-
-        def call_llm_api(self, *args, **kwargs):
-            return '{"decision":"reject","confidence":0.7,"reason":"fallback_check","checks":[]}'
+        def __init__(self):
+            raise AssertionError("LLM fallback must not run for strategy entries")
 
     monkeypatch.setattr(module.AIDecisionFilter, "_jev_config", staticmethod(lambda: {
         "api_key": "secret",
@@ -266,20 +298,16 @@ def test_malformed_jev_answer_falls_back_to_llm(monkeypatch):
     monkeypatch.setattr(module.AIDecisionFilter, "_persist", staticmethod(lambda request, result: None))
     result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
     assert result.allowed is False
-    assert result.provider == "llm"
+    assert result.provider == "jev"
+    assert result.decision == "reject"
+    assert result.reason == "jev_provider_unavailable"
     assert result.fallback_reason.startswith("jev:")
 
 
-def test_llm_is_used_when_jev_is_not_configured(monkeypatch):
+def test_missing_jev_blocks_entry_without_llm_fallback(monkeypatch):
     class LLM:
-        def is_configured(self):
-            return True
-
-        def get_default_model(self):
-            return "configured-model"
-
-        def call_llm_api(self, *args, **kwargs):
-            return '{"decision":"pass","confidence":0.8,"reason":"clear","checks":[]}'
+        def __init__(self):
+            raise AssertionError("LLM fallback must not run when Jev is missing")
 
     monkeypatch.setattr(module.AIDecisionFilter, "_jev_config", staticmethod(lambda: {
         "api_key": "",
@@ -291,9 +319,10 @@ def test_llm_is_used_when_jev_is_not_configured(monkeypatch):
     monkeypatch.setattr(module, "LLMService", LLM)
     monkeypatch.setattr(module.AIDecisionFilter, "_persist", staticmethod(lambda request, result: None))
     result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
-    assert result.allowed is True
-    assert result.provider == "llm"
-    assert result.model == "configured-model"
+    assert result.allowed is False
+    assert result.provider == "none"
+    assert result.decision == "reject"
+    assert result.reason == "jev_not_configured"
 
 
 def test_jev_config_reads_the_latest_persisted_settings(monkeypatch):
@@ -312,12 +341,13 @@ def test_jev_config_reads_the_latest_persisted_settings(monkeypatch):
         "api_key": "saved-key",
         "base_url": "https://example.test/v1",
         "model": "saved-model",
+        "transport": "auto",
         "timeout_seconds": "5",
         "min_confidence": "0.72",
     }
 
 
-def test_low_confidence_jev_result_falls_back_to_llm(monkeypatch):
+def test_low_confidence_jev_result_blocks_entry_without_llm_fallback(monkeypatch):
     class Response:
         def raise_for_status(self):
             return None
@@ -328,14 +358,8 @@ def test_low_confidence_jev_result_falls_back_to_llm(monkeypatch):
             )}
 
     class LLM:
-        def is_configured(self):
-            return True
-
-        def get_default_model(self):
-            return "fallback-model"
-
-        def call_llm_api(self, *args, **kwargs):
-            return '{"decision":"pass","confidence":0.8,"reason":"evidence_reviewed","checks":[]}'
+        def __init__(self):
+            raise AssertionError("LLM fallback must not run for low-confidence Jev results")
 
     monkeypatch.setattr(module.AIDecisionFilter, "_jev_config", staticmethod(lambda: {
         "api_key": "secret",
@@ -350,9 +374,11 @@ def test_low_confidence_jev_result_falls_back_to_llm(monkeypatch):
 
     result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
 
-    assert result.allowed is True
-    assert result.provider == "llm"
-    assert "confidence below threshold" in result.fallback_reason
+    assert result.allowed is False
+    assert result.provider == "jev"
+    assert result.decision == "reject"
+    assert result.reason == "jev_entry_rejected:confidence_below_threshold"
+    assert "entry_decision" in result.fallback_reason
 
 
 def test_billing_charge_and_refund_use_one_decision_reference(monkeypatch):
@@ -393,7 +419,7 @@ def test_ai_decision_filter_default_cost_is_one(monkeypatch):
     assert load_billing_config()["cost_ai_decision_filter"] == 1
 
 
-def test_insufficient_credits_skip_provider_without_blocking_order(monkeypatch):
+def test_insufficient_credits_skip_provider_and_block_order(monkeypatch):
     monkeypatch.setattr(module.AIDecisionFilter, "_jev_config", staticmethod(lambda: {
         "api_key": "secret",
         "base_url": "https://api.typesafe.ai/v1",
@@ -414,24 +440,18 @@ def test_insufficient_credits_skip_provider_without_blocking_order(monkeypatch):
 
     result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
 
-    assert result.allowed is True
-    assert result.decision == "skipped"
+    assert result.allowed is False
+    assert result.decision == "reject"
     assert result.reason == "billing_insufficient_credits"
     assert result.billing["charged"] == 0
 
 
-def test_jev_to_llm_fallback_charges_once(monkeypatch):
+def test_jev_failure_blocks_and_refunds_once(monkeypatch):
     calls = []
 
     class LLM:
-        def is_configured(self):
-            return True
-
-        def get_default_model(self):
-            return "fallback-model"
-
-        def call_llm_api(self, *args, **kwargs):
-            return '{"decision":"pass","confidence":0.8,"reason":"clear","checks":[]}'
+        def __init__(self):
+            raise AssertionError("LLM fallback must not run after Jev failure")
 
     monkeypatch.setattr(module.AIDecisionFilter, "_jev_config", staticmethod(lambda: {
         "api_key": "secret",
@@ -444,7 +464,7 @@ def test_jev_to_llm_fallback_charges_once(monkeypatch):
         lambda *_: (calls.append("consume") or _billing_receipt())
     ))
     monkeypatch.setattr(module.AIDecisionFilter, "_refund_credits", staticmethod(
-        lambda *_: (_ for _ in ()).throw(AssertionError("successful fallback must not refund"))
+        lambda user_id, receipt: {**receipt, "refunded": 1, "status": "refunded"}
     ))
     monkeypatch.setattr(module.requests, "post", lambda *args, **kwargs: (_ for _ in ()).throw(
         RuntimeError("jev unavailable")
@@ -455,11 +475,13 @@ def test_jev_to_llm_fallback_charges_once(monkeypatch):
     result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
 
     assert calls == ["consume"]
-    assert result.provider == "llm"
-    assert result.billing["charged"] == 1
+    assert result.provider == "jev"
+    assert result.allowed is False
+    assert result.reason == "jev_provider_unavailable"
+    assert result.billing["refunded"] == 1
 
 
-def test_all_provider_failures_refund_charge(monkeypatch):
+def test_jev_failure_refunds_charge_and_blocks_entry(monkeypatch):
     class LLM:
         def is_configured(self):
             return False
@@ -483,8 +505,9 @@ def test_all_provider_failures_refund_charge(monkeypatch):
 
     result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
 
-    assert result.allowed is True
-    assert result.reason == "ai_provider_unavailable"
+    assert result.allowed is False
+    assert result.provider == "jev"
+    assert result.reason == "jev_provider_unavailable"
     assert result.billing["refunded"] == 1
     assert result.billing["status"] == "refunded"
 
@@ -509,5 +532,6 @@ def test_unconfigured_ai_does_not_charge(monkeypatch):
 
     result = module.AIDecisionFilter().evaluate(_request(), enabled=True)
 
-    assert result.allowed is True
-    assert result.reason == "ai_not_configured"
+    assert result.allowed is False
+    assert result.decision == "reject"
+    assert result.reason == "jev_not_configured"

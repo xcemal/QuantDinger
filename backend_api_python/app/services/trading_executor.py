@@ -466,6 +466,7 @@ class TradingExecutor:
                 params=runtime_params,
                 universe_resolver=resolve_universe,
                 schedule_timezone=self._load_schedule_timezone(user_id),
+                leverage=float(trading_config.get("leverage") or 1.0),
             )
             primary = candidates[0]
             runtime_run = ensure_strategy_run(

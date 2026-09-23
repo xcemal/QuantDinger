@@ -1,4 +1,4 @@
-"""Fail-open AI decision filter for live entry orders."""
+"""Typed Jev decision filter for live entry orders."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -143,7 +144,14 @@ class AIDecisionResult:
 
 
 class AIDecisionFilter:
-    """Evaluate entry orders with Jev first and an LLM fallback."""
+    """Evaluate entry orders with Jev as the sole configured decision provider.
+
+    A configured AI entry filter is a safety gate.  If Jev cannot produce a
+    valid decision, allowing the order would silently bypass that gate, so
+    provider failures are fail-closed.  The general LLM service remains
+    available to other product features but is intentionally not a fallback
+    for strategy entry decisions.
+    """
 
     def evaluate(self, request: AIDecisionRequest, *, enabled: bool) -> AIDecisionResult:
         decision_id = str(uuid.uuid4())
@@ -161,38 +169,28 @@ class AIDecisionFilter:
             self._persist(request, result)
             return result
 
-        failures: list[str] = []
         jev_config = self._jev_config()
-        llm: LLMService | None = None
-        llm_configured = False
         if not jev_config["api_key"]:
-            try:
-                llm = LLMService()
-                llm_configured = llm.is_configured()
-            except Exception as exc:
-                failures.append(f"llm:{self._safe_error(exc)}")
-                logger.warning("LLM configuration check failed open: %s", exc)
-            if not llm_configured:
-                reason = "ai_provider_unavailable" if failures else "ai_not_configured"
-                result = self._result(
-                    True,
-                    "skipped",
-                    "none",
-                    reason,
-                    decision_id,
-                    started,
-                    fallback_reason="; ".join(failures),
-                )
-                self._persist(request, result)
-                return result
+            result = self._result(
+                False,
+                "reject",
+                "none",
+                "jev_not_configured",
+                decision_id,
+                started,
+                model=jev_config["model"],
+                fallback_reason="JEV_API_KEY is not configured",
+            )
+            self._persist(request, result)
+            return result
 
         billing = self._consume_credits(request.user_id, decision_id)
         if not billing.get("accepted"):
             status = str(billing.get("message") or "")
             reason = "billing_insufficient_credits" if status.startswith("insufficient_credits") else "billing_unavailable"
             result = self._result(
-                True,
-                "skipped",
+                False,
+                "reject",
                 "none",
                 reason,
                 decision_id,
@@ -212,42 +210,22 @@ class AIDecisionFilter:
                 self._persist(request, result)
                 return result
             except Exception as exc:
-                failures.append(f"jev:{self._safe_error(exc)}")
-                logger.warning("Jev decision failed open: %s", exc)
-
-        if llm is None:
-            try:
-                llm = LLMService()
-                llm_configured = llm.is_configured()
-            except Exception as exc:
-                failures.append(f"llm:{self._safe_error(exc)}")
-                logger.warning("LLM configuration check failed open: %s", exc)
-        if llm_configured and llm is not None:
-            try:
-                result = replace(
-                    self._evaluate_llm(request, decision_id, started, failures, service=llm),
+                failure = f"jev:{self._safe_error(exc)}"
+                billing = self._refund_credits(request.user_id, billing)
+                logger.warning("Jev decision blocked entry: %s", exc)
+                result = self._result(
+                    False,
+                    "reject",
+                    "jev",
+                    "jev_provider_unavailable",
+                    decision_id,
+                    started,
+                    model=jev_config["model"],
+                    fallback_reason=failure,
                     billing=billing,
                 )
                 self._persist(request, result)
                 return result
-            except Exception as exc:
-                failures.append(f"llm:{self._safe_error(exc)}")
-                logger.warning("LLM decision failed open: %s", exc)
-
-        billing = self._refund_credits(request.user_id, billing)
-        reason = "ai_not_configured" if not failures else "ai_provider_unavailable"
-        result = self._result(
-            True,
-            "error_allowed" if failures else "skipped",
-            "none",
-            reason,
-            decision_id,
-            started,
-            fallback_reason="; ".join(failures),
-            billing=billing,
-        )
-        self._persist(request, result)
-        return result
 
     def _evaluate_jev(
         self,
@@ -256,21 +234,27 @@ class AIDecisionFilter:
         started: float,
         config: dict[str, str],
     ) -> AIDecisionResult:
-        base_url = config["base_url"].strip().rstrip("/")
-        url = base_url if base_url.endswith("/systemone") else f"{base_url}/systemone"
-        model = config["model"].strip() or "jev-latest"
+        transport = self._jev_transport(config)
+        url = self._jev_url(config, transport)
+        model = self._jev_model(config, transport)
         timeout = max(1.0, min(float(config["timeout_seconds"] or 8), 30.0))
+        payload = {
+            "model": model,
+            "state": self._state_payload(request),
+            "questions": JEV_QUESTIONS,
+        }
+        if transport == "openrouter":
+            # OpenRouter's Decisions API is the typed Jev transport.  Do not
+            # use /chat/completions here: that endpoint is for free-form model
+            # responses and would discard Jev's per-question probabilities.
+            payload["provider"] = {"allow_fallbacks": False}
         response = requests.post(
             url,
             headers={
                 "Authorization": f"Bearer {config['api_key']}",
                 "Content-Type": "application/json",
             },
-            json={
-                "model": model,
-                "state": self._state_payload(request),
-                "questions": JEV_QUESTIONS,
-            },
+            json=payload,
             timeout=timeout,
         )
         response.raise_for_status()
@@ -295,10 +279,27 @@ class AIDecisionFilter:
             })
 
         min_confidence = max(0.0, min(float(config.get("min_confidence") or 0.55), 1.0))
-        for name in ("entry_decision", "risk_check", "execution_quality"):
-            confidence = results[name][2]
-            if confidence is None or confidence < min_confidence:
-                raise ValueError(f"Jev confidence below threshold for {name}")
+        low_confidence_checks = [
+            name
+            for name in ("entry_decision", "risk_check", "execution_quality")
+            if results[name][2] is None or results[name][2] < min_confidence
+        ]
+        if low_confidence_checks:
+            entry_choice, entry_probabilities, entry_confidence = results["entry_decision"]
+            names = ",".join(low_confidence_checks)
+            return self._result(
+                False,
+                "reject",
+                "jev",
+                "jev_entry_rejected:confidence_below_threshold",
+                decision_id,
+                started,
+                model=model,
+                confidence=entry_confidence,
+                probabilities=entry_probabilities,
+                checks=checks,
+                fallback_reason=f"below_min_confidence:{names};threshold={min_confidence:.3f}",
+            )
 
         entry_choice, probabilities, confidence = results["entry_decision"]
         risk_choice = results["risk_check"][0]
@@ -340,6 +341,55 @@ class AIDecisionFilter:
             probabilities=probabilities,
             checks=checks,
         )
+
+    @staticmethod
+    def _jev_transport(config: dict[str, str]) -> str:
+        """Resolve the Jev wire protocol from the configured endpoint.
+
+        TypeSafe exposes ``/v1/systemone`` while OpenRouter exposes the same
+        Jev decision model through ``/api/alpha/decisions``.  The existing
+        deployment uses an OpenRouter base URL, so silently appending
+        ``/systemone`` was the source of the provider-unavailable failures.
+        An explicit ``JEV_TRANSPORT`` can be used for private gateways.
+        """
+        configured = str(config.get("transport") or "auto").strip().lower()
+        if configured in {"native", "typesafe", "systemone"}:
+            return "native"
+        if configured in {"openrouter", "decisions", "alpha"}:
+            return "openrouter"
+        base_url = str(config.get("base_url") or "").strip().lower()
+        model = str(config.get("model") or "").strip().lower()
+        hostname = urlparse(base_url).hostname or ""
+        if "openrouter.ai" in hostname or model.startswith("~typesafe/"):
+            return "openrouter"
+        return "native"
+
+    @classmethod
+    def _jev_model(cls, config: dict[str, str], transport: str) -> str:
+        model = str(config.get("model") or "").strip()
+        if not model:
+            return "~typesafe/jev-latest" if transport == "openrouter" else "jev-latest"
+        if transport == "openrouter" and model == "jev-latest":
+            return "~typesafe/jev-latest"
+        return model
+
+    @classmethod
+    def _jev_url(cls, config: dict[str, str], transport: str) -> str:
+        base_url = str(config.get("base_url") or "").strip().rstrip("/")
+        if transport == "native":
+            return base_url if base_url.endswith("/systemone") else f"{base_url}/systemone"
+
+        # OpenRouter's Decisions API is rooted at /api/alpha, not /api/v1.
+        # Support both the normal OpenRouter base URL and a compatible proxy.
+        if base_url.endswith("/api/v1"):
+            return f"{base_url[:-3]}/alpha/decisions"
+        if base_url.endswith("/v1"):
+            return f"{base_url[:-3]}/alpha/decisions"
+        if base_url.endswith("/api/alpha") or base_url.endswith("/alpha"):
+            return f"{base_url}/decisions"
+        if base_url.endswith("/api"):
+            return f"{base_url}/alpha/decisions"
+        return f"{base_url}/api/alpha/decisions"
 
     def _evaluate_llm(
         self,
@@ -516,6 +566,7 @@ class AIDecisionFilter:
             "api_key": setting("JEV_API_KEY"),
             "base_url": setting("JEV_BASE_URL", "https://api.typesafe.ai/v1"),
             "model": setting("JEV_MODEL", "jev-latest"),
+            "transport": setting("JEV_TRANSPORT", "auto"),
             "timeout_seconds": setting("JEV_TIMEOUT_SECONDS", "8"),
             "min_confidence": setting("JEV_MIN_CONFIDENCE", "0.55"),
         }

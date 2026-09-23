@@ -1628,7 +1628,10 @@ CREATE TABLE IF NOT EXISTS qd_backtest_trades (
     amount DOUBLE PRECISION DEFAULT 0,
     profit DOUBLE PRECISION DEFAULT 0,
     balance DOUBLE PRECISION DEFAULT 0,
-    reason VARCHAR(64) DEFAULT '',
+    -- Strategy API V2 reasons are machine-readable evidence strings and can
+    -- include several key/value fields (direction, ATR, target, evidence,
+    -- regime state, and bar). Keep the full reason for audit/UI inspection.
+    reason TEXT DEFAULT '',
     payload_json TEXT DEFAULT '',
     created_at TIMESTAMP DEFAULT NOW()
 );

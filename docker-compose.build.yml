@@ -11,11 +11,10 @@
 
 services:
   frontend:
-    # Disable the `pull_policy: always` inherited from docker-compose.yml.
-    # Without this, a plain `docker compose up` (or `pull frontend`) would
-    # silently overwrite the locally-built image with the GHCR `:latest`,
-    # discarding the user's local Vue edits.
-    pull_policy: build
+    # Use the local image when it already exists. The launcher explicitly
+    # builds only on first install or when the image is missing, so daily
+    # start/stop does not depend on Docker Hub or GHCR availability.
+    pull_policy: if_not_present
     build:
       context: ${FRONTEND_SRC_PATH:-./QuantDinger-Vue}
       dockerfile: Dockerfile

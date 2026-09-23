@@ -9,6 +9,8 @@ import os
 from typing import Any
 
 from app.services.strategy_v2 import StrategyV2BacktestService
+from app.services.script_source import get_script_source_service
+from app.services.strategy_v2.contract import strategy_source_code_hash
 from app.services.billing_service import BillingError
 from app.utils.agent_auth import (
     SCOPE_B, agent_required, current_token, current_user_id,
@@ -141,6 +143,24 @@ def _run_backtest(payload: dict, on_progress=None) -> Any:
     if not code:
         raise ValueError("code is required")
 
+    # Agent backtests receive source code rather than a human-UI sourceId.
+    # Recover the tenant-owned source identity from the canonical code hash so
+    # results created through the agent gateway remain visible and attributable
+    # in the Backtest Center history.
+    user_id = int(payload.get("__user_id") or 1)
+    source_id = None
+    strategy_name = ""
+    code_hash = strategy_source_code_hash(code)
+    try:
+        for source in get_script_source_service().list_sources(user_id):
+            if strategy_source_code_hash(str(source.get("code") or "")) != code_hash:
+                continue
+            source_id = int(source.get("id") or 0) or None
+            strategy_name = str(source.get("name") or "").strip()
+            break
+    except Exception:
+        logger.exception("Unable to resolve agent backtest source metadata")
+
     start_date = _parse_date(payload.get("startDate"))
     end_date = _parse_date(payload.get("endDate"))
     if not start_date or not end_date:
@@ -156,7 +176,7 @@ def _run_backtest(payload: dict, on_progress=None) -> Any:
     if on_progress:
         on_progress({"phase": "running_backtest", "percent": 25})
     run_id, result = _backtest.run(
-        user_id=int(payload.get("__user_id") or 1),
+        user_id=user_id,
         code=code,
         start_date=start_date,
         end_date=end_date.replace(hour=23, minute=59, second=59),
@@ -166,6 +186,8 @@ def _run_backtest(payload: dict, on_progress=None) -> Any:
         commission=commission,
         slippage=slippage,
         params=params if isinstance(params, dict) else {},
+        source_id=source_id,
+        strategy_name=strategy_name,
         instrument_rules_snapshot_id=str(
             payload.get("instrumentRulesSnapshotId") or ""
         ).strip(),

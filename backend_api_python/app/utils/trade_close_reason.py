@@ -104,6 +104,35 @@ _LABELS_EN: Dict[str, str] = {
     LEGACY_SIGNAL_TRIGGER: "Signal close",
 }
 
+_LABELS_TR: Dict[str, str] = {
+    GRID_LONG_ENTRY: "Grid long açılışı",
+    GRID_LONG_EXIT: "Grid long kapanışı",
+    GRID_SHORT_ENTRY: "Grid short açılışı",
+    GRID_SHORT_EXIT: "Grid short kapatması",
+    GRID_INITIAL_LONG: "İlk long pozisyon",
+    GRID_INITIAL_SHORT: "İlk short pozisyon",
+    GRID_REDUCE_LONG: "Grid long azaltma",
+    GRID_REDUCE_SHORT: "Grid short azaltma",
+    GRID_CLOSE_ALL: "Grid tümünü kapat",
+    GRID_WATERFALL_CLOSE: "Zincirleme düşüş koruması kapanışı",
+    GRID_EQUITY_STOP_LOSS: "Grid özsermaye stop-loss",
+    GRID_EQUITY_TAKE_PROFIT: "Grid özsermaye take-profit",
+    GRID_EQUITY_TRAILING_STOP: "Grid takip eden stop kapanışı",
+    DCA_EQUITY_STOP_LOSS: "DCA toplam özsermaye stop-loss",
+    DCA_EQUITY_TAKE_PROFIT: "DCA toplam özsermaye take-profit",
+    DCA_EQUITY_TRAILING_STOP: "DCA toplam özsermaye takip eden stop",
+    ROBOT_EQUITY_STOP_LOSS: "Robot toplam özsermaye stop-loss",
+    ROBOT_EQUITY_TAKE_PROFIT: "Robot toplam özsermaye take-profit",
+    ROBOT_EQUITY_TRAILING_STOP: "Robot toplam özsermaye takip eden stop",
+    GRID_OUT_OF_BOUNDS_UP: "Grid üst sınır kırılımı",
+    GRID_OUT_OF_BOUNDS_DOWN: "Grid alt sınır kırılımı",
+    SERVER_STOP_LOSS: "Stop-loss kapanışı",
+    SERVER_TAKE_PROFIT: "Take-profit kapanışı",
+    SERVER_TRAILING_STOP: "Takip eden stop kapanışı",
+    INDICATOR_SIGNAL: "Sinyal kapanışı",
+    LEGACY_SIGNAL_TRIGGER: "Sinyal kapanışı",
+}
+
 
 def is_exit_trade_type(trade_type: str) -> bool:
     t = str(trade_type or "").strip().lower()
@@ -114,7 +143,11 @@ def label_for_reason(reason: str, *, lang: str = "zh") -> str:
     code = str(reason or "").strip()
     if not code:
         return ""
-    table = _LABELS_ZH if str(lang or "zh").lower().startswith("zh") else _LABELS_EN
+    lang_norm = str(lang or "zh").lower()
+    if lang_norm.startswith("tr"):
+        table = _LABELS_TR
+    else:
+        table = _LABELS_ZH if lang_norm.startswith("zh") else _LABELS_EN
     return table.get(code, code)
 
 

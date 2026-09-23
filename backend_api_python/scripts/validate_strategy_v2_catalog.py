@@ -143,8 +143,8 @@ def catalog_entries() -> list[dict[str, Any]]:
         for item in source_service.list_templates()
         if str(item.get("template_key") or "").startswith("strategy_v2_")
     ]
-    if len(templates) != 12:
-        raise RuntimeError(f"Expected 12 Strategy API V2 templates, found {len(templates)}")
+    if len(templates) != 15:
+        raise RuntimeError(f"Expected 15 Strategy API V2 templates, found {len(templates)}")
     entries = [
         {
             "catalog_key": item["template_key"],
@@ -186,8 +186,8 @@ def catalog_entries() -> list[dict[str, Any]]:
                 "catalog_group": "robot",
             }
         )
-    if len(entries) != 16:
-        raise RuntimeError(f"Expected 16 catalog entries, found {len(entries)}")
+    if len(entries) != 19:
+        raise RuntimeError(f"Expected 19 catalog entries, found {len(entries)}")
     return entries
 
 

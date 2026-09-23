@@ -72,9 +72,10 @@ class BaseDataSource(ABC):
         low: float,
         close: float,
         volume: float,
+        taker_buy_volume: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Normalize one K-line row while preserving provider price precision; volume keeps two decimals."""
-        return {
+        row = {
             'time': timestamp,
             'open': float(open_price),
             'high': float(high),
@@ -82,6 +83,9 @@ class BaseDataSource(ABC):
             'close': float(close),
             'volume': round(float(volume), 2),
         }
+        if taker_buy_volume is not None:
+            row['taker_buy_volume'] = float(taker_buy_volume)
+        return row
     
     def calculate_time_range(
         self,

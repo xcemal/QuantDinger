@@ -34,6 +34,7 @@ from app.utils.logger import get_logger
 from app.utils.auth import login_required
 from app.services.quick_trade.balances import empty_balance_dict, fetch_balance_raw, parse_balance as _parse_balance
 from app.services.quick_trade.credentials import build_exchange_config, create_exchange_client
+from app.services.live_trading.factory import exchange_market_scope
 from app.services.quick_trade.errors import (
     exchange_error_user_message,
     merge_balance_leg_errors,
@@ -754,6 +755,14 @@ def get_balance():
 
         base_cfg = build_exchange_config(credential_id, user_id, {})
         exchange_id = (base_cfg.get("exchange_id") or "").strip().lower()
+        configured_scope = exchange_market_scope(base_cfg)
+        allowed_market_types = (
+            ("spot",)
+            if configured_scope == "spot"
+            else ("swap",)
+            if configured_scope == "swap"
+            else ("swap", "spot")
+        )
         qt_rej = _reject_quick_trade_if_desktop_broker(exchange_id)
         if qt_rej is not None:
             return qt_rej
@@ -762,7 +771,10 @@ def get_balance():
             swap_bal = empty_balance_dict()
             spot_bal = empty_balance_dict()
 
-            for mt in ("swap", "spot"):
+            # A credential can be deliberately restricted to one market leg.
+            # Do not probe the other leg and surface a predictable
+            # CREDENTIAL_MARKET_SCOPE_MISMATCH as a global account error.
+            for mt in allowed_market_types:
                 try:
                     cfg = build_exchange_config(credential_id, user_id, {"market_type": mt})
                     client = create_exchange_client(cfg, market_type=mt)

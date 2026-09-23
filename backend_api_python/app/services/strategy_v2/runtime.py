@@ -213,11 +213,15 @@ class StrategyRuntimeContext:
         portal: MultiAssetDataPortal,
         portfolio: PortfolioState,
         params: Mapping[str, Any] | None = None,
+        leverage: float = 1.0,
     ) -> None:
         self.portal = portal
         self.data = StrategyDataView(portal)
         self.portfolio = portfolio
         self.params = dict(params or {})
+        # Expose the selected execution leverage to native Strategy API V2 code
+        # so risk-based sizing can match the broker's notional multiplier.
+        self.leverage = max(1.0, float(leverage or 1.0))
         self.current_dt: pd.Timestamp | None = None
         self.previous_trading_date: pd.Timestamp | None = None
         self._orders: list[OrderIntent] = []
@@ -568,6 +572,7 @@ class StrategyRuntimeContext:
                 "take_profit_pct",
                 "trailing_stop_pct",
                 "trailing_activation_pct",
+                "trailing_lock_profit_pct",
                 "time_limit_seconds",
                 "trailing_rebase_on_scale_in",
             )
@@ -1503,8 +1508,6 @@ class MultiAssetSimulationBroker:
             return order.value * notional_multiplier / price
         if order.kind == "target_percent":
             target_value = equity * order.value * notional_multiplier
-            if target_value > 0:
-                target_value /= (1.0 + self.slippage) * (1.0 + self.commission)
             return target_value / price
         raise StrategyV2ContractError(f"strategyV2.orderKindUnsupported:{order.kind}")
 
@@ -1743,6 +1746,7 @@ class StrategyV2BacktestRunner:
             portal=self.portal,
             portfolio=self.broker.portfolio,
             params=runtime_params,
+            leverage=requested_leverage,
         )
         self.logs: list[str] = []
         self._order_status_cursor = 0
@@ -2260,6 +2264,7 @@ class StrategyV2LiveSession:
         params: Mapping[str, Any] | None = None,
         universe_resolver=None,
         schedule_timezone: str = "UTC",
+        leverage: float = 1.0,
     ) -> None:
         self.program = compile_strategy_v2(code)
         self._universe_resolver = universe_resolver
@@ -2270,7 +2275,12 @@ class StrategyV2LiveSession:
             universe_resolver=universe_resolver,
         )
         self.portfolio = PortfolioState(initial_capital, initial_capital, total_value=initial_capital)
-        self.context = StrategyRuntimeContext(portal=self.portal, portfolio=self.portfolio, params=params)
+        self.context = StrategyRuntimeContext(
+            portal=self.portal,
+            portfolio=self.portfolio,
+            params=params,
+            leverage=leverage,
+        )
         self.context.live_order_cancellation = True
         self.persist_strategy_state = (
             _truthy(self.program.namespace.get("PERSIST_RUNTIME_STATE"))

@@ -675,6 +675,10 @@ class CryptoDataSource(BaseDataSource):
                     low=candle[3],
                     close=candle[4],
                     volume=candle[5],
+                    # Binance USD-M futures klines expose taker-buy base
+                    # asset volume at index 9.  Other providers return the
+                    # standard six-field OHLCV row and intentionally omit it.
+                    taker_buy_volume=(candle[9] if len(candle) > 9 else None),
                 ))
             
             klines = self.filter_and_limit(
@@ -821,15 +825,67 @@ class CryptoDataSource(BaseDataSource):
             chunk = ohlcv[i:i + bucket_size]
             if len(chunk) < bucket_size:
                 break  # drop incomplete trailing bucket
-            out.append([
+            row = [
                 chunk[0][0],
                 chunk[0][1],
                 max(c[2] for c in chunk),
                 min(c[3] for c in chunk),
                 chunk[-1][4],
                 sum(c[5] for c in chunk),
-            ])
+            ]
+            # Preserve Binance's extended futures-kline fields when a finer
+            # source interval is resampled.  Index 9 is taker-buy base asset
+            # volume; indices 7/8/10 are additive quote/trade diagnostics.
+            if all(len(c) > 9 for c in chunk):
+                row.extend([
+                    chunk[-1][6] if len(chunk[-1]) > 6 else None,
+                    sum(c[7] for c in chunk) if all(len(c) > 7 for c in chunk) else None,
+                    sum(c[8] for c in chunk) if all(len(c) > 8 for c in chunk) else None,
+                    sum(c[9] for c in chunk),
+                    sum(c[10] for c in chunk) if all(len(c) > 10 for c in chunk) else None,
+                    chunk[-1][11] if len(chunk[-1]) > 11 else None,
+                ])
+            out.append(row)
         return out
+
+    def _fetch_exchange_ohlcv(
+        self,
+        symbol_pair: str,
+        ccxt_timeframe: str,
+        *,
+        since: Optional[int] = None,
+        limit: Optional[int] = None,
+        end_time: Optional[int] = None,
+    ) -> List:
+        """Fetch OHLCV, retaining Binance USD-M taker-buy volume when available.
+
+        CCXT's normalized ``fetch_ohlcv`` deliberately returns only six fields.
+        Binance futures' native kline endpoint contains the additional
+        taker-buy base-asset volume needed by research strategies.  This path is
+        used only for the explicitly Binance USD-M swap source; all other
+        providers retain the existing normalized CCXT behavior.
+        """
+        exchange_id = str(getattr(self.exchange, "id", "") or "").strip().lower()
+        market_type = str(getattr(self, "_scoped_market_type", "") or "").strip().lower()
+        native = getattr(self.exchange, "fapiPublicGetKlines", None)
+        if exchange_id == "binanceusdm" and market_type == "swap" and callable(native):
+            api_symbol = str(symbol_pair or "").split(":", 1)[0].replace("/", "").upper()
+            params: Dict[str, Any] = {
+                "symbol": api_symbol,
+                "interval": ccxt_timeframe,
+                "limit": min(int(limit or self._SINGLE_FETCH_HARD_CAP), 1500),
+            }
+            if since is not None:
+                params["startTime"] = int(since)
+            if end_time is not None:
+                params["endTime"] = int(end_time)
+            return native(params)
+        return self.exchange.fetch_ohlcv(
+            symbol_pair,
+            ccxt_timeframe,
+            since=since,
+            limit=limit,
+        )
 
     @classmethod
     def _ccxt_to_qd_timeframe(cls, ccxt_tf: str, fallback: str) -> str:
@@ -936,11 +992,12 @@ class CryptoDataSource(BaseDataSource):
                     last_err = None
                     for attempt in range(retry_per_batch + 1):
                         try:
-                            batch = self.exchange.fetch_ohlcv(
+                            batch = self._fetch_exchange_ohlcv(
                                 symbol_pair,
                                 ccxt_timeframe,
                                 since=current_since,
                                 limit=batch_limit,
+                                end_time=end_ms,
                             )
                             break
                         except Exception as exc:
@@ -1014,7 +1071,11 @@ class CryptoDataSource(BaseDataSource):
                 # rejecting the request outright or silently truncating, which
                 # downstream code then interprets as "empty data".
                 safe_limit = min(int(limit), self._SINGLE_FETCH_HARD_CAP)
-                ohlcv = self.exchange.fetch_ohlcv(symbol_pair, ccxt_timeframe, limit=safe_limit)
+                ohlcv = self._fetch_exchange_ohlcv(
+                    symbol_pair,
+                    ccxt_timeframe,
+                    limit=safe_limit,
+                )
 
             return ohlcv
 
@@ -1089,7 +1150,12 @@ class CryptoDataSource(BaseDataSource):
             # exactly when it mattered. Cap it so we at least return one valid
             # page of data, which downstream callers can then handle gracefully.
             safe_limit = min(int(limit), self._SINGLE_FETCH_HARD_CAP)
-            ohlcv = self.exchange.fetch_ohlcv(symbol_pair, ccxt_timeframe, since=since, limit=safe_limit)
+            ohlcv = self._fetch_exchange_ohlcv(
+                symbol_pair,
+                ccxt_timeframe,
+                since=since,
+                limit=safe_limit,
+            )
             if ohlcv:
                 return ohlcv
         except Exception as e:
@@ -1101,7 +1167,7 @@ class CryptoDataSource(BaseDataSource):
             logger.warning("Requested-window fallback failed for %s: %s", symbol_pair, str(e))
 
         try:
-            recent = self.exchange.fetch_ohlcv(
+            recent = self._fetch_exchange_ohlcv(
                 symbol_pair,
                 ccxt_timeframe,
                 limit=min(int(limit), self._SINGLE_FETCH_HARD_CAP),

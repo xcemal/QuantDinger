@@ -101,12 +101,15 @@ class StrategyReviewService:
         trading_config = strategy.get("trading_config") if isinstance(strategy.get("trading_config"), dict) else {}
         exchange_config = strategy.get("exchange_config") if isinstance(strategy.get("exchange_config"), dict) else {}
         bot_type = str(strategy.get("bot_type") or trading_config.get("bot_type") or "").strip().lower()
-        lang_short = "zh" if str(language or "").lower().startswith("zh") else "en"
+        language_norm = str(language or "").lower()
+        lang_short = "tr" if language_norm.startswith("tr") else ("zh" if language_norm.startswith("zh") else "en")
 
         all_trades = self._load_trades(strategy_id=strategy_id, bot_type=bot_type, lang=lang_short)
         trades = [t for t in all_trades if _row_ts(t) >= since_ts]
         positions = self._load_positions(strategy_id=strategy_id)
         logs = self._load_recent_logs(strategy_id=strategy_id, since_ts=since_ts)
+        ai_decisions = self._load_ai_decisions(strategy_id=strategy_id, since_ts=since_ts)
+        strategy_source = self._load_strategy_source(strategy=strategy)
 
         metrics = self._build_metrics(
             strategy=strategy,
@@ -122,6 +125,12 @@ class StrategyReviewService:
             trading_config=trading_config,
             bot_type=bot_type,
             language=language,
+        )
+        evidence = self._build_review_evidence(
+            trades=trades,
+            positions=positions,
+            ai_decisions=ai_decisions,
+            strategy_source=strategy_source,
         )
 
         base_report = {
@@ -146,7 +155,9 @@ class StrategyReviewService:
             "samples": {
                 "recent_trades": [self._compact_trade(t) for t in trades[-30:]],
                 "recent_logs": logs[:20],
+                "ai_decisions": [self._compact_ai_decision(d) for d in ai_decisions[-20:]],
             },
+            "evidence": evidence,
             "ai": {
                 "enabled": bool(include_ai),
                 "status": "skipped",
@@ -355,7 +366,7 @@ class StrategyReviewService:
                 cur.execute(
                     """
                     SELECT id, strategy_id, symbol, side, size, entry_price,
-                           current_price, unrealized_pnl, created_at, updated_at
+                           current_price, unrealized_pnl, updated_at AS created_at, updated_at
                     FROM qd_strategy_positions
                     WHERE strategy_id = ?
                     ORDER BY id ASC
@@ -394,6 +405,261 @@ class StrategyReviewService:
         except Exception as exc:
             logger.warning("strategy review logs load failed: %s", exc)
             return []
+
+    def _load_ai_decisions(self, *, strategy_id: int, since_ts: int) -> List[Dict[str, Any]]:
+        """Load the strategy decision audit without exposing secrets to the reviewer."""
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT id, symbol, action, provider, model, decision, allowed,
+                           confidence, reason, fallback_reason, probabilities_json,
+                           checks_json, request_snapshot, latency_ms, created_at
+                    FROM qd_ai_decisions
+                    WHERE source_type = 'strategy' AND source_id = ?
+                    ORDER BY created_at ASC, id ASC
+                    """,
+                    (int(strategy_id),),
+                )
+                rows = cur.fetchall() or []
+                cur.close()
+            out = []
+            for row in rows:
+                item = _jsonify_row(row)
+                if _row_ts(item) >= since_ts:
+                    item["probabilities_json"] = self._coerce_json(item.get("probabilities_json"), {})
+                    item["checks_json"] = self._coerce_json(item.get("checks_json"), [])
+                    item["request_snapshot"] = self._coerce_json(item.get("request_snapshot"), {})
+                    out.append(item)
+            return out
+        except Exception as exc:
+            logger.warning("strategy review AI decisions load failed: %s", exc)
+            return []
+
+    def _load_strategy_source(self, *, strategy: Dict[str, Any]) -> Dict[str, Any]:
+        """Load the deployed source version so the review can inspect actual strategy logic."""
+        trading_config = strategy.get("trading_config") if isinstance(strategy.get("trading_config"), dict) else {}
+        version_id = _as_int(
+            strategy.get("source_version_id")
+            or trading_config.get("script_source_version_id")
+            or trading_config.get("source_version_id")
+        )
+        if version_id <= 0:
+            return {}
+        try:
+            with get_db_connection() as db:
+                cur = db.cursor()
+                cur.execute(
+                    """
+                    SELECT id, source_id, version_no, name, description, template_key, code
+                    FROM qd_script_source_versions
+                    WHERE id = ? AND user_id = ?
+                    LIMIT 1
+                    """,
+                    (int(version_id), int(strategy.get("user_id") or 1)),
+                )
+                row = cur.fetchone()
+                cur.close()
+            if not row:
+                return {}
+            item = _jsonify_row(row)
+            code = str(item.get("code") or "")
+            max_code = 16000
+            item["code"] = code[:max_code]
+            item["code_truncated"] = len(code) > max_code
+            return item
+        except Exception as exc:
+            logger.warning("strategy review source load failed: %s", exc)
+            return {}
+
+    @staticmethod
+    def _coerce_json(value: Any, default: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                return parsed if isinstance(parsed, type(default)) else default
+            except Exception:
+                return default
+        return default
+
+    @staticmethod
+    def _trade_side(trade: Dict[str, Any]) -> str:
+        trade_type = str(trade.get("type") or "").lower()
+        if "short" in trade_type:
+            return "SHORT"
+        if "long" in trade_type:
+            return "LONG"
+        return "UNKNOWN"
+
+    def _compact_ai_decision(self, decision: Dict[str, Any]) -> Dict[str, Any]:
+        snapshot = self._coerce_json(decision.get("request_snapshot"), {})
+        context = snapshot.get("context") if isinstance(snapshot, dict) else {}
+        if not isinstance(context, dict):
+            context = {}
+        market = context.get("market_evidence") if isinstance(context.get("market_evidence"), dict) else {}
+        timeframes = market.get("timeframes") if isinstance(market.get("timeframes"), dict) else {}
+        primary_tf = str(market.get("primary_timeframe") or "5m")
+        primary = timeframes.get(primary_tf) if isinstance(timeframes.get(primary_tf), dict) else {}
+        order_budget = context.get("order_budget") if isinstance(context.get("order_budget"), dict) else {}
+        protection = context.get("protection") if isinstance(context.get("protection"), dict) else {}
+        signal_reason = str(snapshot.get("signal_reason") or "").strip()
+        checks = self._coerce_json(decision.get("checks_json"), [])
+        compact_checks = []
+        for check in checks[:8] if isinstance(checks, list) else []:
+            if not isinstance(check, dict):
+                continue
+            compact_checks.append({
+                "name": check.get("name"),
+                "result": check.get("result"),
+                "confidence": _round(check.get("confidence"), 4),
+            })
+        probabilities = self._coerce_json(decision.get("probabilities_json"), {})
+        return {
+            "id": decision.get("id"),
+            "time": _row_ts(decision),
+            "symbol": decision.get("symbol") or snapshot.get("symbol") or "",
+            "action": decision.get("action") or snapshot.get("action") or "",
+            "side": str(order_budget.get("side") or self._trade_side({"type": decision.get("action")})).upper(),
+            "provider": decision.get("provider") or "none",
+            "model": decision.get("model") or "",
+            "decision": decision.get("decision") or "",
+            "allowed": bool(decision.get("allowed")),
+            "confidence": None if decision.get("confidence") is None else _round(decision.get("confidence"), 4),
+            "reason": str(decision.get("reason") or ""),
+            "fallback_reason": str(decision.get("fallback_reason") or ""),
+            "latency_ms": _as_int(decision.get("latency_ms")),
+            "signal_reason": signal_reason,
+            "reference_price": _round(snapshot.get("reference_price"), 8),
+            "stop_loss_pct": _round(protection.get("stop_loss_pct"), 6),
+            "take_profit_pct": _round(protection.get("take_profit_pct"), 6),
+            "market": {
+                "data_quality": market.get("data_quality") or "",
+                "trend": primary.get("trend") or "",
+                "atr_pct": _round(primary.get("atr14_pct"), 6),
+                "volume_ratio_20": _round(primary.get("volume_ratio_20"), 4),
+                "is_stale": bool(primary.get("is_stale")),
+            },
+            "probabilities": probabilities if isinstance(probabilities, dict) else {},
+            "checks": compact_checks,
+        }
+
+    def _build_review_evidence(
+        self,
+        *,
+        trades: List[Dict[str, Any]],
+        positions: List[Dict[str, Any]],
+        ai_decisions: List[Dict[str, Any]],
+        strategy_source: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Create compact, factual evidence for a strategy-specific AI review."""
+        by_symbol: Dict[str, Dict[str, Any]] = {}
+        by_side: Dict[str, Dict[str, Any]] = {}
+        for trade in trades:
+            symbol = str(trade.get("symbol") or "UNKNOWN").strip() or "UNKNOWN"
+            side = self._trade_side(trade)
+            trade_type = str(trade.get("type") or "").lower()
+            is_exit = is_exit_trade_type(trade_type)
+            bucket = by_symbol.setdefault(symbol, {
+                "symbol": symbol,
+                "events": 0,
+                "opens": 0,
+                "closes": 0,
+                "closed_pnl_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "net_pnl": 0.0,
+                "stop_loss_exits": 0,
+                "take_profit_exits": 0,
+                "sides": [],
+            })
+            side_bucket = by_side.setdefault(side, {
+                "side": side,
+                "events": 0,
+                "opens": 0,
+                "closes": 0,
+                "closed_pnl_trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "net_pnl": 0.0,
+            })
+            for item in (bucket, side_bucket):
+                item["events"] += 1
+                if is_exit:
+                    item["closes"] += 1
+                else:
+                    item["opens"] += 1
+            if side not in bucket["sides"]:
+                bucket["sides"].append(side)
+            if is_exit and trade.get("profit") is not None:
+                pnl = _as_float(trade.get("profit"))
+                for item in (bucket, side_bucket):
+                    item["closed_pnl_trades"] += 1
+                    item["net_pnl"] += pnl
+                    if pnl > 0:
+                        item["wins"] += 1
+                    elif pnl < 0:
+                        item["losses"] += 1
+                close_reason = str(trade.get("close_reason") or "").lower()
+                if "stop" in close_reason or "loss" in close_reason:
+                    bucket["stop_loss_exits"] += 1
+                if "take" in close_reason or "profit" in close_reason:
+                    bucket["take_profit_exits"] += 1
+
+        def clean_bucket(item: Dict[str, Any]) -> Dict[str, Any]:
+            result = dict(item)
+            result["net_pnl"] = _round(result.get("net_pnl"), 4)
+            return result
+
+        compact_decisions = [self._compact_ai_decision(d) for d in ai_decisions]
+        jev_decisions = [d for d in compact_decisions if str(d.get("provider") or "").lower() == "jev"]
+        fail_open = [
+            d for d in compact_decisions
+            if str(d.get("decision") or "").lower() in {"error_allowed", "fallback_allowed"}
+            or "provider_unavailable" in str(d.get("reason") or "").lower()
+            or "provider_unavailable" in str(d.get("fallback_reason") or "").lower()
+        ]
+        latency_values = [_as_int(d.get("latency_ms")) for d in compact_decisions if _as_int(d.get("latency_ms")) > 0]
+        confidence_values = [
+            _as_float(d.get("confidence")) for d in compact_decisions
+            if d.get("confidence") is not None
+        ]
+        ai_summary = {
+            "total": len(compact_decisions),
+            "jev_total": len(jev_decisions),
+            "jev_allowed": len([d for d in jev_decisions if d.get("allowed")]),
+            "jev_rejected": len([d for d in jev_decisions if not d.get("allowed")]),
+            "fail_open_legacy": len(fail_open),
+            "by_decision": dict(Counter(str(d.get("decision") or "unknown") for d in compact_decisions)),
+            "avg_latency_ms": _round(sum(latency_values) / len(latency_values), 2) if latency_values else 0.0,
+            "avg_confidence": _round(sum(confidence_values) / len(confidence_values), 4) if confidence_values else None,
+        }
+        compact_positions = [
+            {
+                "symbol": p.get("symbol"),
+                "side": p.get("side"),
+                "size": _round(p.get("size"), 8),
+                "entry_price": _round(p.get("entry_price"), 8),
+                "current_price": _round(p.get("current_price"), 8),
+                "unrealized_pnl": _round(p.get("unrealized_pnl"), 4),
+            }
+            for p in positions
+        ]
+        return {
+            "scope": {
+                "trade_events": len(trades),
+                "decision_events": len(compact_decisions),
+                "note": "Only persisted QuantDinger records are included; missing signal telemetry is reported as unknown.",
+            },
+            "by_symbol": [clean_bucket(v) for v in sorted(by_symbol.values(), key=lambda x: (x.get("net_pnl", 0), x.get("symbol", "")))],
+            "by_side": [clean_bucket(v) for v in sorted(by_side.values(), key=lambda x: x.get("side", ""))],
+            "ai_summary": ai_summary,
+            "ai_decisions": compact_decisions[-20:],
+            "open_positions": compact_positions,
+            "strategy_source": strategy_source,
+        }
 
     def _build_metrics(
         self,
@@ -867,9 +1133,60 @@ class StrategyReviewService:
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         diagnostics: List[Dict[str, Any]] = []
         recommendations: List[Dict[str, Any]] = []
-        is_zh = str(language or "").lower().startswith("zh")
+        language_norm = str(language or "").lower()
+        is_zh = language_norm.startswith("zh")
+        is_tr = language_norm.startswith("tr")
+
+        tr_texts = {
+            "Sample is still small": "Örneklem hâlâ küçük",
+            "Fewer than 5 closed trades have realised PnL in the selected review window. Treat the conclusion as directional.": "Seçilen inceleme aralığında gerçekleşmiş PnL içeren 5'ten az kapanmış işlem var. Sonuçları yalnızca yön gösterici kabul edin.",
+            "Collect more closed trades": "Daha fazla kapanmış işlem biriktirin",
+            "Keep the report in observe mode until the strategy has at least 10-20 closed trades.": "Stratejide en az 10-20 kapanmış işlem oluşana kadar raporu gözlem modunda tutun.",
+            "Review-window realised PnL is negative": "İnceleme aralığındaki gerçekleşmiş PnL negatif",
+            "The strategy lost money after fees in the selected review window.": "Seçilen inceleme aralığında strateji komisyonlar sonrasında zarar etmiş.",
+            "Reduce risk before expanding capital": "Sermayeyi artırmadan önce riski azaltın",
+            "Do not increase leverage or capital until the next backtest or out-of-sample check improves expectancy.": "Bir sonraki backtest veya örneklem dışı kontrolde beklenen değer iyileşene kadar kaldıraç ya da sermayeyi artırmayın.",
+            "Profit factor is below 1": "Kâr faktörü 1'in altında",
+            "Winning trades are not covering losing trades and fees.": "Kazanan işlemler kaybeden işlemleri ve komisyonları karşılamıyor.",
+            "Review entry and exit filters": "Giriş ve çıkış filtrelerini inceleyin",
+            "Check whether entries are too early, exits are too late, or the strategy is being used in the wrong market regime.": "Girişlerin erken, çıkışların geç olup olmadığını ve stratejinin yanlış piyasa rejiminde kullanılıp kullanılmadığını kontrol edin.",
+            "Win rate is low": "Kazanma oranı düşük",
+            "The strategy loses more often than it wins. This is only acceptable when average wins are much larger than losses.": "Strateji kazandığından daha sık kaybediyor. Bu ancak ortalama kazançlar kayıplardan belirgin biçimde büyükse kabul edilebilir.",
+            "Tighten signal quality": "Sinyal kalitesi eşiğini yükseltin",
+            "Consider adding trend, volatility, or volume confirmation before new entries.": "Yeni girişlerden önce trend, volatilite veya hacim doğrulaması eklemeyi değerlendirin.",
+            "Performance drawdown is elevated": "Performans geri çekilmesi yüksek",
+            "The performance-page equity path shows a meaningful peak-to-trough drop.": "Performans sayfasındaki özsermaye eğrisi anlamlı bir tepe-dip düşüşü gösteriyor.",
+            "Cap position size": "Pozisyon büyüklüğünü sınırlayın",
+            "Lower entry percentage or maximum position while this strategy is under review.": "Bu strateji incelenirken giriş yüzdesini veya azami pozisyonu düşürün.",
+            "Consecutive losses detected": "Arka arkaya kayıplar tespit edildi",
+            "The strategy had a losing streak that can pressure margin and operator confidence.": "Stratejide teminatı ve uygulama güvenini zorlayabilecek bir kayıp serisi oluşmuş.",
+            "Add a cooldown after loss streaks": "Kayıp serilerinden sonra bekleme süresi ekleyin",
+            "Consider pausing new entries after 3 consecutive realised losses until the next confirmed setup.": "Arka arkaya 3 gerçekleşmiş kayıptan sonra, yeni doğrulanmış kurulum gelene kadar yeni girişleri duraklatmayı değerlendirin.",
+            "Fees are material": "Komisyon etkisi önemli",
+            "Commissions are large compared with realised PnL, so small edges may be erased.": "Komisyonlar gerçekleşmiş PnL'ye göre yüksek; küçük avantajlar işlem maliyetiyle silinebilir.",
+            "Reduce churn or improve execution": "Gereksiz işlem dönüşünü azaltın veya uygulamayı iyileştirin",
+            "Use fewer but higher-quality signals, maker orders where appropriate, or wider grid spacing.": "Daha az ama kaliteli sinyal kullanın; uygun yerde maker emirleri veya daha geniş grid aralığı değerlendirin.",
+            "Some grid matches closed below net profit": "Bazı grid eşleşmeleri net kârın altında kapandı",
+            "Grid matched rows include negative net PnL after fees.": "Grid eşleşmeleri arasında komisyon sonrası negatif net PnL içeren kayıtlar var.",
+            "Check grid spacing versus fees": "Grid aralığını komisyonlara göre kontrol edin",
+            "Increase grid spacing or lower trading frequency so each matched pair covers both entry and exit fees.": "Her eşleşmenin giriş ve çıkış komisyonlarını karşılaması için grid aralığını artırın veya işlem sıklığını düşürün.",
+            "Many entries are not closed yet": "Birçok giriş henüz kapanmadı",
+            "The trade log has more opens than exits in the selected review window.": "Seçilen inceleme aralığındaki işlem kaydında çıkıştan daha fazla giriş var.",
+            "Review accumulated exposure": "Birikmiş pozisyon riskini inceleyin",
+            "Make sure the strategy is intentionally scaling in and that max position limits are active.": "Stratejinin bilinçli olarak kademeli giriş yaptığından ve azami pozisyon limitlerinin etkin olduğundan emin olun.",
+            "Open positions are present": "Açık pozisyonlar mevcut",
+            "The report includes unrealized PnL, but final performance is not locked until positions close.": "Rapor gerçekleşmemiş PnL'yi içeriyor; ancak pozisyonlar kapanana kadar nihai performans kesinleşmez.",
+            "Window PnL and performance return differ": "Aralık PnL'si ile performans getirisi farklı",
+            "The selected review window can be profitable while the full performance equity curve remains negative.": "Seçilen inceleme aralığı kârlı olabilirken tam performans özsermaye eğrisi negatif kalabilir.",
+            "No obvious issue in this window": "Bu aralıkta belirgin bir sorun yok",
+            "The deterministic checks did not find a clear risk concentration. Continue monitoring sample size and live execution drift.": "Kural tabanlı kontroller belirgin bir risk yoğunlaşması bulmadı. Örneklem büyüklüğünü ve canlı uygulama sapmasını izlemeye devam edin.",
+            "Keep monitoring": "İzlemeye devam edin",
+            "No automatic parameter change is recommended from this sample alone.": "Yalnızca bu örnekleme dayanarak otomatik parametre değişikliği önerilmiyor.",
+        }
 
         def text(en: str, zh: str) -> str:
+            if is_tr:
+                return tr_texts.get(en, en)
             return zh if is_zh else en
 
         def diag(severity: str, code: str, title: str, detail: str, value: Any = None) -> None:
@@ -1142,9 +1459,11 @@ class StrategyReviewService:
         language_norm = str(language or "").lower()
         is_zh = language_norm.startswith("zh")
         is_zh_tw = is_zh and ("tw" in language_norm or "hant" in language_norm)
+        is_tr = language_norm.startswith("tr")
         metrics = base_report.get("metrics") or {}
         diagnostics = base_report.get("diagnostics") or []
         recommendations = base_report.get("recommendations") or []
+        evidence = base_report.get("evidence") if isinstance(base_report.get("evidence"), dict) else {}
 
         default = {
             "enabled": True,
@@ -1153,10 +1472,16 @@ class StrategyReviewService:
             "provider": "",
             "model": "",
             "elapsed_ms": 0,
-            "summary": self._fallback_summary_zh(metrics, diagnostics) if is_zh else self._fallback_summary_en(metrics, diagnostics),
+            "summary": (
+                self._fallback_summary_tr(metrics, diagnostics)
+                if is_tr else self._fallback_summary_zh(metrics, diagnostics) if is_zh
+                else self._fallback_summary_en(metrics, diagnostics)
+            ),
             "diagnosis": [d.get("detail") or d.get("title") for d in diagnostics[:5]],
             "recommendations": [r.get("detail") or r.get("title") for r in recommendations[:5]],
             "cautions": [
+                "Bu inceleme gerçek işlem, pozisyon, Jev karar ve kural kanıtlarına dayanır; strateji parametrelerini otomatik olarak değiştirmez."
+                if is_tr else
                 "这是基于成交记录、持仓和规则指标生成的复盘，不会自动修改策略参数。"
                 if is_zh else
                 "This review is based on trades, positions, and rule metrics. It does not change parameters automatically."
@@ -1173,8 +1498,8 @@ class StrategyReviewService:
             default["provider"] = provider.value
             default["model"] = model
 
-            if not llm.get_api_key(provider):
-                default["error"] = f"LLM provider {provider.value} has no API key configured."
+            if not llm.is_configured(provider):
+                default["error"] = f"LLM provider {provider.value} is not configured."
                 default["report"] = default["error"]
                 return default
 
@@ -1188,15 +1513,21 @@ class StrategyReviewService:
                 "metrics": metrics,
                 "diagnostics": diagnostics[:8],
                 "rule_recommendations": recommendations[:8],
+                "evidence": evidence,
             }
             system_prompt = (
                 "You are a professional quantitative trading strategy reviewer. "
-                "Use only the provided metrics and diagnostics. Do not invent trades, prices, dates, or parameters. "
+                "Use only the provided metrics, diagnostics, strategy source, and persisted evidence. Do not invent trades, prices, dates, or parameters. "
                 "Clearly distinguish selected-window realised PnL from full performance-page return/drawdown. "
+                "This is a forensic review: cite concrete symbols, sides, counts, PnL, exit reasons, signal_reason values, and Jev decisions when present. "
+                "Separate facts from inferences and explicitly state when the sample is too small or telemetry is missing. "
+                "Do not propose parameter changes as if they were validated; recommendations must be observational next steps only. "
                 "Return strict JSON with keys: summary, diagnosis, recommendations, cautions. "
                 "diagnosis, recommendations, and cautions must be arrays of short strings."
             )
-            if is_zh_tw:
+            if is_tr:
+                system_prompt += " Write in Turkish. Use Turkish decimal and trading terminology naturally, but preserve machine-readable reason codes exactly."
+            elif is_zh_tw:
                 system_prompt += " Write in Traditional Chinese."
             elif is_zh:
                 system_prompt += " Write in Simplified Chinese."
@@ -1251,6 +1582,17 @@ class StrategyReviewService:
             f"最大回撤{metrics.get('performance_max_drawdown_pct', metrics.get('max_drawdown_pct', 0))}%。"
             f"窗口胜率{metrics.get('win_rate', 0)}%，盈亏比{metrics.get('profit_factor', 0)}。"
             f"规则引擎识别到{len(diagnostics)}个复盘要点。"
+        )
+
+    def _fallback_summary_tr(self, metrics: Dict[str, Any], diagnostics: List[Dict[str, Any]]) -> str:
+        return (
+            f"Son {metrics.get('lookback_days', 30)} günlük inceleme aralığında "
+            f"{metrics.get('closed_trades_with_pnl', 0)} kapanmış PnL işlemi ve "
+            f"{metrics.get('window_net_pnl', metrics.get('total_net_pnl', 0))} gerçekleşmiş net PnL var. "
+            f"Performans sayfası ile uyumlu getiri {metrics.get('performance_total_return_pct', metrics.get('total_return_pct', 0))}%, "
+            f"azami geri çekilme {metrics.get('performance_max_drawdown_pct', metrics.get('max_drawdown_pct', 0))}%. "
+            f"Kazanma oranı {metrics.get('win_rate', 0)}%, kâr faktörü {metrics.get('profit_factor', 0)}. "
+            f"Kural motoru {len(diagnostics)} inceleme noktası buldu."
         )
 
     def _fallback_summary_en(self, metrics: Dict[str, Any], diagnostics: List[Dict[str, Any]]) -> str:

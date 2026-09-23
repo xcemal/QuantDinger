@@ -1,12 +1,11 @@
 # QuantDinger Docker Compose - One-Click Deployment
 # Usage:
-#   1. Copy env.example to .env and edit your settings
-#      cp backend_api_python/env.example backend_api_python/.env
-#   2. IMPORTANT: Generate and set a secure SECRET_KEY in backend_api_python/.env
+#   1. Prepare the project-root `.env` and `backend.env` with your settings
+#   2. IMPORTANT: Generate and set a secure SECRET_KEY in backend.env
 #      SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
-#      Or edit backend_api_python/.env and replace SECRET_KEY value
+#      Or edit backend.env and replace SECRET_KEY value
 #   3. docker-compose up -d --build
-#   4. Open http://localhost:8888 (web) or http://localhost:8889 (mobile H5)
+#   4. Open http://localhost:18080 (web)
 #
 # Backend is built from local source. Frontend and mobile H5 are pulled from
 # GHCR. Override tags or image paths via FRONTEND_IMAGE / MOBILE_IMAGE /
@@ -102,7 +101,9 @@ services:
       - ${POSTGRES_DATA_SOURCE:-postgres_data}:${POSTGRES_PGDATA:-/var/lib/postgresql/18/docker}
       - ./backend_api_python/migrations/init.sql:/docker-entrypoint-initdb.d/01-init.sql
     ports:
-      - "${DB_PORT:-127.0.0.1:5432}:5432"
+      # The app uses the Docker network; this host binding is only for local
+      # database inspection and avoids common host-port collisions by default.
+      - "${DB_HOST_PORT:-127.0.0.1:15432}:5432"
     networks:
       - quantdinger-network
     healthcheck:
@@ -127,7 +128,9 @@ services:
         if [ -n "$$REDIS_PASSWORD" ]; then set -- --requirepass "$$REDIS_PASSWORD"; fi
         exec redis-server --maxmemory "${REDIS_CACHE_MAXMEMORY:-128mb}" --maxmemory-policy allkeys-lru "$$@"
     ports:
-      - "${REDIS_PORT:-127.0.0.1:6379}:6379"
+      # The app uses redis:6379 internally. Override REDIS_HOST_PORT only when
+      # host-side Redis access is needed.
+      - "${REDIS_HOST_PORT:-127.0.0.1:16379}:6379"
     networks:
       - quantdinger-network
     healthcheck:
@@ -171,7 +174,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./backend_api_python/.env:/app/.env
+      - ./backend.env:/app/.env
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-quantdinger}:${POSTGRES_PASSWORD:-quantdinger123}@postgres:5432/${POSTGRES_DB:-quantdinger}
       DB_TYPE: postgresql
@@ -203,12 +206,14 @@ services:
       migration:
         condition: service_completed_successfully
     ports:
-      - "${BACKEND_PORT:-127.0.0.1:5000}:5000"
+      # Frontend reaches backend as backend:5000 inside Docker. The host-side
+      # binding is only for local API inspection and avoids common collisions.
+      - "${BACKEND_HOST_PORT:-127.0.0.1:15000}:5000"
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
       # Mount .env for runtime config and admin-panel updates
-      - ./backend_api_python/.env:/app/.env
+      - ./backend.env:/app/.env
     environment:
       - PYTHON_API_HOST=0.0.0.0
       - PYTHON_API_PORT=5000
@@ -251,12 +256,12 @@ services:
       - GUNICORN_THREADS=${GUNICORN_THREADS:-4}
       # IBKR needs local TWS or IB Gateway; set false on SaaS cloud (see env.example).
       - ALLOW_LOCAL_DESKTOP_BROKERS=${ALLOW_LOCAL_DESKTOP_BROKERS:-true}
-      # Spot full close / open fee buffer (Admin → Settings → Live Trading, or backend_api_python/.env)
+      # Spot full close / open fee buffer (Admin → Settings → Live Trading, or backend.env)
       - SPOT_CLOSE_SAFETY_RATIO=${SPOT_CLOSE_SAFETY_RATIO:-1.0}
       - SPOT_OPEN_QUOTE_BUFFER=${SPOT_OPEN_QUOTE_BUFFER:-0.995}
       # Takes precedence over mounted .env (run.py load_dotenv override=False).
       # Include :8000 when using Vite dev server alongside this stack.
-      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:8888,http://localhost:8889,http://localhost:8000}
+      - FRONTEND_URL=${FRONTEND_URL:-http://localhost:18080,http://localhost:8888,http://localhost:8889,http://localhost:8000}
     networks:
       - quantdinger-network
     healthcheck:
@@ -314,7 +319,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./backend_api_python/.env:/app/.env
+      - ./backend.env:/app/.env
     environment:
       <<: *worker-environment
       QD_PROCESS_ROLE: trading
@@ -347,7 +352,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./backend_api_python/.env:/app/.env
+      - ./backend.env:/app/.env
     environment:
       <<: *worker-environment
       QD_PROCESS_ROLE: scheduler
@@ -379,7 +384,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./backend_api_python/.env:/app/.env
+      - ./backend.env:/app/.env
     environment:
       <<: *worker-environment
       QD_PROCESS_ROLE: celery
@@ -409,7 +414,7 @@ services:
     volumes:
       - backend_logs:/app/logs
       - backend_data:/app/data
-      - ./backend_api_python/.env:/app/.env
+      - ./backend.env:/app/.env
     environment:
       <<: *worker-environment
       QD_PROCESS_ROLE: celery
@@ -441,7 +446,7 @@ services:
     container_name: quantdinger-frontend
     restart: unless-stopped
     ports:
-      - "${FRONTEND_HOST:-127.0.0.1}:${FRONTEND_PORT:-8888}:80"
+      - "${FRONTEND_HOST:-127.0.0.1}:${FRONTEND_HOST_PORT:-18080}:80"
     environment:
       # nginx envsubst will inject this into the proxy_pass directive at start.
       # Override with the backend's reachable URL when deploying outside compose

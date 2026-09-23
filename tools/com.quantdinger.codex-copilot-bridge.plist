@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.quantdinger.codex-copilot-bridge</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/cemal/Documents/pc/QuantDinger/tools/codex_copilot_bridge.py</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/cemal/Documents/pc/QuantDinger</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>CODEX_BIN</key>
+        <string>/Users/cemal/.local/bin/codex</string>
+        <key>CODEX_BRIDGE_CWD</key>
+        <string>/tmp</string>
+        <key>PATH</key>
+        <string>/Users/cemal/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/quantdinger-codex-bridge.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/quantdinger-codex-bridge.error.log</string>
+</dict>
+</plist>

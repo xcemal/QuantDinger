@@ -24,12 +24,13 @@ def _seed_entries():
 
 def test_strategy_v2_seed_has_explicit_cta_and_portfolio_catalogs():
     entries = _seed_entries()
-    assert len(entries) == 12
+    assert len(entries) == 15
     seed_sql = SEED_PATH.read_text(encoding="utf-8")
     assert seed_sql.count('"version":11') == 11
     assert seed_sql.count('"version":12') == 1
+    assert seed_sql.count('"version":13') == 3
     assert sum(item["asset_type"] == "script" for item in entries) == 8
-    assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 4
+    assert sum(item["asset_type"] == "portfolio_strategy" for item in entries) == 7
 
     by_key = {item["key"]: item for item in entries}
     assert by_key["strategy_v2_supertrend"]["asset_type"] == "script"
@@ -53,7 +54,12 @@ def test_strategy_v2_seed_templates_compile_and_expose_parameters():
 def test_strategy_v2_seed_templates_declare_current_direction_contract():
     for item in _seed_entries():
         manifest = compile_strategy_v2(item["code"]).manifest
-        expected = "one_way" if item["key"] == "strategy_v2_double_ma" else "long_only"
+        expected = "one_way" if item["key"] in {
+            "strategy_v2_double_ma",
+            "strategy_v2_rapid_accel",
+            "strategy_v2_trend_flip",
+            "strategy_v2_sweep_absorption",
+        } else "long_only"
         assert manifest.direction_mode == expected, item["key"]
 
 
@@ -94,7 +100,13 @@ def test_macd_kdj_default_exposure_is_safe_without_user_enabled_leverage():
 
 
 def test_portfolio_templates_use_fixed_ten_symbol_universe():
-    portfolios = [item for item in _seed_entries() if item["asset_type"] == "portfolio_strategy"]
+    portfolios = [
+        item for item in _seed_entries()
+        if item["asset_type"] == "portfolio_strategy"
+        and not item["key"].startswith("strategy_v2_rapid_")
+        and not item["key"].startswith("strategy_v2_trend_")
+        and not item["key"].startswith("strategy_v2_sweep_")
+    ]
     for item in portfolios:
         manifest = compile_strategy_v2(item["code"]).manifest
         assert manifest.universe.kind == "static"
@@ -135,9 +147,13 @@ def test_every_seed_template_completes_a_synthetic_v2_backtest():
         }
         frames.setdefault("USStock:SPY", _template_frame(11))
 
+        frequency_frames = None
+        if item["key"] == "strategy_v2_sweep_absorption":
+            frequency_frames = {"1m": frames, "5m": frames}
         result = StrategyV2BacktestRunner(
             code=item["code"],
             frames=frames,
+            frequency_frames=frequency_frames,
             initial_capital=100_000,
             commission=0,
             slippage=0,

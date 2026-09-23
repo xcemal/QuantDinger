@@ -14,6 +14,7 @@ class ProtectionSpec:
     take_profit_pct: float = 0.0
     trailing_stop_pct: float = 0.0
     trailing_activation_pct: float = 0.0
+    trailing_lock_profit_pct: float = 0.0
     time_limit_seconds: int = 0
     trailing_rebase_on_scale_in: bool = True
 
@@ -25,6 +26,11 @@ class ProtectionSpec:
             self,
             "trailing_activation_pct",
             _ratio(self.trailing_activation_pct, maximum=5.0),
+        )
+        object.__setattr__(
+            self,
+            "trailing_lock_profit_pct",
+            _ratio(self.trailing_lock_profit_pct, maximum=1.0),
         )
         object.__setattr__(self, "time_limit_seconds", max(0, int(self.time_limit_seconds or 0)))
         object.__setattr__(
@@ -57,11 +63,16 @@ class ProtectionSpec:
         if isinstance(trailing, Mapping):
             source.setdefault("trailing_stop_pct", trailing.get("pct"))
             source.setdefault("trailing_activation_pct", trailing.get("activation_pct"))
+            source.setdefault(
+                "trailing_lock_profit_pct",
+                trailing.get("lock_profit_pct", trailing.get("min_profit_pct")),
+            )
         spec = cls(
             stop_loss_pct=source.get("stop_loss_pct"),
             take_profit_pct=source.get("take_profit_pct"),
             trailing_stop_pct=source.get("trailing_stop_pct"),
             trailing_activation_pct=source.get("trailing_activation_pct"),
+            trailing_lock_profit_pct=source.get("trailing_lock_profit_pct"),
             time_limit_seconds=source.get("time_limit_seconds"),
             trailing_rebase_on_scale_in=source.get(
                 "trailing_rebase_on_scale_in",
@@ -301,7 +312,13 @@ class ProtectionEngine:
                 state.trailing_active = True
             if not state.trailing_active:
                 return None
-            return state.highest_price * (1 - spec.trailing_stop_pct)
+            trailing = state.highest_price * (1 - spec.trailing_stop_pct)
+            if spec.trailing_lock_profit_pct > 0:
+                trailing = max(
+                    trailing,
+                    state.entry_price * (1 + spec.trailing_lock_profit_pct),
+                )
+            return trailing
         if (
             not state.trailing_active
             and state.lowest_price <= state.entry_price * (1 - spec.trailing_activation_pct)
@@ -309,7 +326,13 @@ class ProtectionEngine:
             state.trailing_active = True
         if not state.trailing_active:
             return None
-        return state.lowest_price * (1 + spec.trailing_stop_pct)
+        trailing = state.lowest_price * (1 + spec.trailing_stop_pct)
+        if spec.trailing_lock_profit_pct > 0:
+            trailing = min(
+                trailing,
+                state.entry_price * (1 - spec.trailing_lock_profit_pct),
+            )
+        return trailing
 
     @staticmethod
     def _time_limit_reached(state: ProtectionState, timestamp: pd.Timestamp) -> bool:

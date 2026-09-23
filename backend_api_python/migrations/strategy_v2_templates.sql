@@ -13,7 +13,10 @@ WHERE template_key NOT IN (
     'strategy_v2_market_cap_barbell',
     'strategy_v2_momentum_top_n',
     'strategy_v2_low_volatility',
-    'strategy_v2_quality_growth'
+    'strategy_v2_quality_growth',
+    'strategy_v2_rapid_accel',
+    'strategy_v2_trend_flip',
+    'strategy_v2_sweep_absorption'
 );
 
 INSERT INTO qd_script_templates
@@ -604,7 +607,690 @@ def rebalance(context, data):
     weight = min(max_weight, 1.0 / len(selected)) if selected else 0.0
     for symbol in selected:
         order_target_percent(symbol, weight, reason="quality_growth")
-$quality$, '{"params":[{"name":"top_n","type":"integer","default":5,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_roe","type":"number","default":0.1,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"min_growth","type":"number","default":0,"min":-1,"max":5,"step":0.01,"labelKey":"strategyV2.params.minGrowth"},{"name":"max_debt_to_equity","type":"number","default":2,"min":0,"max":10,"step":0.1,"labelKey":"strategyV2.params.maxDebtToEquity"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","quality","growth"]'::jsonb, 'radar-chart', 'purple', 140, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW())
+$quality$, '{"params":[{"name":"top_n","type":"integer","default":5,"min":1,"max":10,"step":1,"labelKey":"strategyV2.params.topN"},{"name":"min_roe","type":"number","default":0.1,"min":-1,"max":1,"step":0.01,"labelKey":"strategyV2.params.minRoe"},{"name":"min_growth","type":"number","default":0,"min":-1,"max":5,"step":0.01,"labelKey":"strategyV2.params.minGrowth"},{"name":"max_debt_to_equity","type":"number","default":2,"min":0,"max":10,"step":0.1,"labelKey":"strategyV2.params.maxDebtToEquity"},{"name":"max_weight","type":"percent","default":0.2,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.maxWeight"}]}'::jsonb, '["strategy-v2","portfolio","cross-sectional","fundamental","quality","growth"]'::jsonb, 'radar-chart', 'purple', 140, TRUE, '{"source":"system_seed","version":11,"apiVersion":2}'::jsonb, NOW()),
+('strategy_v2_rapid_accel', 'portfolio_strategy', 'Rapid Acceleration', 'A 1m HA reversal followed by three accelerating, near-wickless crypto swap candles.', $rapidaccel$"""Native Strategy API V2 example: HA reversal followed by accelerating candles.
+
+This source is intentionally self-contained because Strategy API V2 programs are
+compiled in the user strategy sandbox.  It emits signed one-way crypto-swap
+orders and keeps the full signal rationale in the native order ``reason``.
+"""
+
+# @param adx_length int 14 range=5:40:1
+# @param adx_min float 20 range=5:50:1
+# @param wick_tolerance float 0.15 range=0.02:0.5:0.01
+# @param atr_length int 14 range=5:50:1
+# @param stop_multiplier float 1.8 range=0.5:6:0.1
+# @param reward_risk float 2.0 range=0.5:5:0.25
+# @param target_pct float 0.25 range=0.05:1:0.05
+
+
+UNIVERSE = [
+    "Crypto:BTC/USDT@swap", "Crypto:ETH/USDT@swap", "Crypto:SOL/USDT@swap",
+    "Crypto:BNB/USDT@swap", "Crypto:XRP/USDT@swap", "Crypto:DOGE/USDT@swap",
+    "Crypto:ADA/USDT@swap", "Crypto:AVAX/USDT@swap", "Crypto:LINK/USDT@swap",
+    "Crypto:BCH/USDT@swap", "Crypto:LTC/USDT@swap", "Crypto:DOT/USDT@swap",
+    "Crypto:SUI/USDT@swap", "Crypto:TRX/USDT@swap", "Crypto:AAVE/USDT@swap",
+    "Crypto:UNI/USDT@swap", "Crypto:NEAR/USDT@swap", "Crypto:APT/USDT@swap",
+    "Crypto:ARB/USDT@swap", "Crypto:OP/USDT@swap", "Crypto:INJ/USDT@swap",
+    "Crypto:ATOM/USDT@swap", "Crypto:FIL/USDT@swap", "Crypto:ETC/USDT@swap",
+    "Crypto:TON/USDT@swap",
+]
+
+
+def initialize(context):
+    g.last_signal = {}
+    context.set_universe(UNIVERSE)
+    context.subscribe(frequency="1m", fields=["open", "high", "low", "close", "volume"])
+    context.set_metadata(direction_mode="one_way", strategy_family="RAPID_ACCEL")
+    context.set_warmup(180)
+    context.allow_leverage(max_leverage=3)
+
+
+def _true_ranges(bars):
+    values = []
+    for index in range(1, len(bars)):
+        high = float(bars["high"].iloc[index])
+        low = float(bars["low"].iloc[index])
+        previous_close = float(bars["close"].iloc[index - 1])
+        values.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+    return values
+
+
+def _atr(bars, length):
+    values = _true_ranges(bars)
+    if not values:
+        return 0.0
+    length = max(1, int(length))
+    if len(values) <= length:
+        return sum(values) / len(values)
+    current = sum(values[:length]) / length
+    for value in values[length:]:
+        current = ((current * (length - 1)) + value) / length
+    return current
+
+
+def _adx(bars, length):
+    length = max(2, int(length))
+    if len(bars) < length * 2 + 2:
+        return 0.0
+    true_ranges = []
+    plus_moves = []
+    minus_moves = []
+    for index in range(1, len(bars)):
+        high = float(bars["high"].iloc[index])
+        low = float(bars["low"].iloc[index])
+        previous_high = float(bars["high"].iloc[index - 1])
+        previous_low = float(bars["low"].iloc[index - 1])
+        previous_close = float(bars["close"].iloc[index - 1])
+        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+        up = high - previous_high
+        down = previous_low - low
+        plus_moves.append(up if up > down and up > 0 else 0.0)
+        minus_moves.append(down if down > up and down > 0 else 0.0)
+    if len(true_ranges) < length:
+        return 0.0
+    smoothed_tr = sum(true_ranges[:length])
+    smoothed_plus = sum(plus_moves[:length])
+    smoothed_minus = sum(minus_moves[:length])
+    dx_values = []
+    for index in range(length - 1, len(true_ranges)):
+        if index >= length:
+            smoothed_tr = smoothed_tr - (smoothed_tr / length) + true_ranges[index]
+            smoothed_plus = smoothed_plus - (smoothed_plus / length) + plus_moves[index]
+            smoothed_minus = smoothed_minus - (smoothed_minus / length) + minus_moves[index]
+        if smoothed_tr <= 0:
+            continue
+        plus_di = 100.0 * smoothed_plus / smoothed_tr
+        minus_di = 100.0 * smoothed_minus / smoothed_tr
+        denominator = plus_di + minus_di
+        dx_values.append(100.0 * abs(plus_di - minus_di) / denominator if denominator > 0 else 0.0)
+    if len(dx_values) < length:
+        return sum(dx_values) / len(dx_values) if dx_values else 0.0
+    current = sum(dx_values[:length]) / length
+    for value in dx_values[length:]:
+        current = ((current * (length - 1)) + value) / length
+    return current
+
+
+def _ha_values(bars):
+    opens = []
+    closes = []
+    for index in range(len(bars)):
+        raw_open = float(bars["open"].iloc[index])
+        raw_high = float(bars["high"].iloc[index])
+        raw_low = float(bars["low"].iloc[index])
+        raw_close = float(bars["close"].iloc[index])
+        ha_close = (raw_open + raw_high + raw_low + raw_close) / 4.0
+        ha_open = (raw_open + raw_close) / 2.0 if index == 0 else (opens[-1] + closes[-1]) / 2.0
+        opens.append(ha_open)
+        closes.append(ha_close)
+    return opens, closes
+
+
+def _near_wickless(bars, index, direction, tolerance):
+    raw_open = float(bars["open"].iloc[index])
+    raw_high = float(bars["high"].iloc[index])
+    raw_low = float(bars["low"].iloc[index])
+    raw_close = float(bars["close"].iloc[index])
+    body = abs(raw_close - raw_open)
+    if body <= 0:
+        return False
+    directional_wick = min(raw_open, raw_close) - raw_low if direction > 0 else raw_high - max(raw_open, raw_close)
+    return directional_wick <= body * max(0.0, tolerance)
+
+
+def _number(value):
+    return str(round(float(value), 8))
+
+
+def _signal_reason(direction, entry, stop, target, rr, adx, body_ratio, bar_time):
+    direction_name = "LONG" if direction > 0 else "SHORT"
+    return (
+        "RAPID_ACCEL|direction=" + direction_name
+        + "|reference_entry=" + _number(entry)
+        + "|stop=" + _number(stop)
+        + "|target=" + _number(target)
+        + "|reward_risk=" + _number(rr)
+        + "|signal_age=0|adx=" + _number(adx)
+        + "|ha_body_acceleration=" + _number(body_ratio)
+        + "|evidence=ha_reversal+3_body_increase+near_wickless"
+        + "|bar=" + str(bar_time)
+    )
+
+
+def _trade(context, symbol, direction, entry, stop, target, rr, adx, body_ratio, bar_time, target_pct):
+    amount = float(get_position(symbol).amount or 0.0)
+    if direction > 0 and amount < -1e-12:
+        order_target_percent(symbol, 0.0, reason="RAPID_ACCEL|close_opposite|direction=LONG")
+        return
+    if direction < 0 and amount > 1e-12:
+        order_target_percent(symbol, 0.0, reason="RAPID_ACCEL|close_opposite|direction=SHORT")
+        return
+    if (direction > 0 and amount > 1e-12) or (direction < 0 and amount < -1e-12):
+        return
+    reason = _signal_reason(direction, entry, stop, target, rr, adx, body_ratio, bar_time)
+    side = "long" if direction > 0 else "short"
+    client_id = "rapid-accel-" + side + "-" + str(symbol) + "-" + str(bar_time).replace(" ", "T").replace(":", "")
+    order_target_percent(
+        symbol,
+        target_pct if direction > 0 else -target_pct,
+        reason=reason,
+        stop_loss_pct=abs(entry - stop) / entry,
+        take_profit_pct=abs(target - entry) / entry,
+        client_order_id=client_id,
+    )
+
+
+def handle_data(context, data):
+    adx_length = int(context.params.get("adx_length", 14))
+    adx_min = float(context.params.get("adx_min", 20.0))
+    wick_tolerance = float(context.params.get("wick_tolerance", 0.15))
+    atr_length = int(context.params.get("atr_length", 14))
+    stop_multiplier = float(context.params.get("stop_multiplier", 1.8))
+    reward_risk = float(context.params.get("reward_risk", 2.0))
+    target_pct = float(context.params.get("target_pct", 0.25))
+    count = max(atr_length * 3, adx_length * 3, 60) + 8
+    for symbol in UNIVERSE:
+        bars = get_history(count, "1m", ["open", "high", "low", "close", "volume"], symbol)
+        if len(bars) < max(adx_length * 2 + 4, atr_length + 8, 12):
+            continue
+        bar_time = str(bars.index[-1])
+        if g.last_signal.get(symbol) == bar_time:
+            continue
+        ha_open, ha_close = _ha_values(bars)
+        colors = [1 if ha_close[index] > ha_open[index] else -1 for index in range(len(bars))]
+        if len(colors) < 5:
+            continue
+        direction = 1 if colors[-4:] == [-1, 1, 1, 1] else -1 if colors[-4:] == [1, -1, -1, -1] else 0
+        if direction == 0:
+            continue
+        if not all(_near_wickless(bars, index, direction, wick_tolerance) for index in range(len(bars) - 3, len(bars))):
+            continue
+        bodies = [abs(ha_close[index] - ha_open[index]) for index in range(len(bars))]
+        if not (bodies[-3] > bodies[-4] and bodies[-2] > bodies[-3] and bodies[-1] > bodies[-2]):
+            continue
+        adx = _adx(bars, adx_length)
+        if adx < adx_min:
+            continue
+        entry = float(bars["close"].iloc[-1])
+        atr = _atr(bars, atr_length)
+        if entry <= 0 or atr <= 0:
+            continue
+        stop = entry - stop_multiplier * atr if direction > 0 else entry + stop_multiplier * atr
+        target = entry + reward_risk * (entry - stop) if direction > 0 else entry - reward_risk * (stop - entry)
+        body_ratio = bodies[-1] / bodies[-2] if bodies[-2] > 0 else 0.0
+        _trade(context, symbol, direction, entry, stop, target, reward_risk, adx, body_ratio, bar_time, target_pct)
+        g.last_signal[symbol] = bar_time
+$rapidaccel$, '{"params":[{"name":"adx_length","type":"integer","default":14,"min":5,"max":40,"step":1,"labelKey":"strategyV2.params.adx_length"},{"name":"adx_min","type":"number","default":20,"min":5,"max":50,"step":1,"labelKey":"strategyV2.params.adx_min"},{"name":"wick_tolerance","type":"number","default":0.15,"min":0.02,"max":0.5,"step":0.01,"labelKey":"strategyV2.params.wick_tolerance"},{"name":"atr_length","type":"integer","default":14,"min":5,"max":50,"step":1,"labelKey":"strategyV2.params.atr_length"},{"name":"stop_multiplier","type":"number","default":1.8,"min":0.5,"max":6,"step":0.1,"labelKey":"strategyV2.params.stop_multiplier"},{"name":"reward_risk","type":"number","default":2,"min":0.5,"max":5,"step":0.25,"labelKey":"strategyV2.params.reward_risk"},{"name":"target_pct","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.target_pct"}]}'::jsonb, '["strategy-v2","cta","crypto","swap","one-way","1m","momentum"]'::jsonb, 'bolt', 'orange', 150, TRUE, '{"source":"system_seed","version":13,"apiVersion":2,"executionMode":"signal","researchStatus":"exploratory_defaults"}'::jsonb, NOW()),
+
+('strategy_v2_trend_flip', 'portfolio_strategy', 'Trend Flip', '5m SuperTrend direction-flip events gated by ADX, Choppiness, and ATR-normalized risk.', $trendflip$"""Native Strategy API V2 example: event-only SuperTrend flips."""
+
+import math
+
+# @param st_atr_length int 10 range=5:50:1
+# @param st_factor float 3.0 range=1:8:0.25
+# @param adx_length int 14 range=5:40:1
+# @param adx_min float 20 range=5:50:1
+# @param chop_length int 14 range=5:50:1
+# @param chop_max float 61.8 range=40:75:0.5
+# @param stop_multiplier float 2.0 range=0.5:6:0.25
+# @param reward_risk float 2.0 range=0.5:5:0.25
+# @param max_stop_pct float 0.04 range=0.005:0.15:0.005
+# @param target_pct float 0.25 range=0.05:1:0.05
+
+
+UNIVERSE = [
+    "Crypto:BTC/USDT@swap", "Crypto:ETH/USDT@swap", "Crypto:SOL/USDT@swap",
+    "Crypto:BNB/USDT@swap", "Crypto:XRP/USDT@swap", "Crypto:DOGE/USDT@swap",
+    "Crypto:ADA/USDT@swap", "Crypto:AVAX/USDT@swap", "Crypto:LINK/USDT@swap",
+    "Crypto:BCH/USDT@swap", "Crypto:LTC/USDT@swap", "Crypto:DOT/USDT@swap",
+    "Crypto:SUI/USDT@swap", "Crypto:TRX/USDT@swap", "Crypto:AAVE/USDT@swap",
+    "Crypto:UNI/USDT@swap", "Crypto:NEAR/USDT@swap", "Crypto:APT/USDT@swap",
+    "Crypto:ARB/USDT@swap", "Crypto:OP/USDT@swap", "Crypto:INJ/USDT@swap",
+    "Crypto:ATOM/USDT@swap", "Crypto:FIL/USDT@swap", "Crypto:ETC/USDT@swap",
+    "Crypto:TON/USDT@swap",
+]
+
+
+def initialize(context):
+    g.last_signal = {}
+    context.set_universe(UNIVERSE)
+    context.subscribe(frequency="5m", fields=["open", "high", "low", "close", "volume"])
+    context.set_metadata(direction_mode="one_way", strategy_family="TREND_FLIP")
+    context.set_warmup(220)
+    context.allow_leverage(max_leverage=3)
+
+
+def _true_ranges(bars):
+    values = []
+    for index in range(1, len(bars)):
+        high = float(bars["high"].iloc[index])
+        low = float(bars["low"].iloc[index])
+        previous_close = float(bars["close"].iloc[index - 1])
+        values.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+    return values
+
+
+def _atr(bars, length):
+    values = _true_ranges(bars)
+    if not values:
+        return 0.0
+    length = max(1, int(length))
+    if len(values) <= length:
+        return sum(values) / len(values)
+    current = sum(values[:length]) / length
+    for value in values[length:]:
+        current = ((current * (length - 1)) + value) / length
+    return current
+
+
+def _adx(bars, length):
+    length = max(2, int(length))
+    if len(bars) < length * 2 + 2:
+        return 0.0
+    true_ranges = []
+    plus_moves = []
+    minus_moves = []
+    for index in range(1, len(bars)):
+        high = float(bars["high"].iloc[index])
+        low = float(bars["low"].iloc[index])
+        previous_high = float(bars["high"].iloc[index - 1])
+        previous_low = float(bars["low"].iloc[index - 1])
+        previous_close = float(bars["close"].iloc[index - 1])
+        true_ranges.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+        up = high - previous_high
+        down = previous_low - low
+        plus_moves.append(up if up > down and up > 0 else 0.0)
+        minus_moves.append(down if down > up and down > 0 else 0.0)
+    smoothed_tr = sum(true_ranges[:length])
+    smoothed_plus = sum(plus_moves[:length])
+    smoothed_minus = sum(minus_moves[:length])
+    dx_values = []
+    for index in range(length - 1, len(true_ranges)):
+        if index >= length:
+            smoothed_tr = smoothed_tr - (smoothed_tr / length) + true_ranges[index]
+            smoothed_plus = smoothed_plus - (smoothed_plus / length) + plus_moves[index]
+            smoothed_minus = smoothed_minus - (smoothed_minus / length) + minus_moves[index]
+        if smoothed_tr <= 0:
+            continue
+        plus_di = 100.0 * smoothed_plus / smoothed_tr
+        minus_di = 100.0 * smoothed_minus / smoothed_tr
+        denominator = plus_di + minus_di
+        dx_values.append(100.0 * abs(plus_di - minus_di) / denominator if denominator > 0 else 0.0)
+    if len(dx_values) < length:
+        return sum(dx_values) / len(dx_values) if dx_values else 0.0
+    current = sum(dx_values[:length]) / length
+    for value in dx_values[length:]:
+        current = ((current * (length - 1)) + value) / length
+    return current
+
+
+def _supertrend_directions(bars, length, factor):
+    true_ranges = _true_ranges(bars)
+    atr_values = [0.0 for _ in range(len(bars))]
+    if len(true_ranges) < length:
+        return atr_values, [0 for _ in range(len(bars))]
+    current_atr = sum(true_ranges[:length]) / length
+    atr_values[length] = current_atr
+    for index in range(length + 1, len(bars)):
+        current_atr = ((current_atr * (length - 1)) + true_ranges[index - 1]) / length
+        atr_values[index] = current_atr
+    upper = 0.0
+    lower = 0.0
+    directions = [0 for _ in range(len(bars))]
+    for index in range(length, len(bars)):
+        high = float(bars["high"].iloc[index])
+        low = float(bars["low"].iloc[index])
+        close = float(bars["close"].iloc[index])
+        previous_close = float(bars["close"].iloc[index - 1])
+        middle = (high + low) / 2.0
+        basic_upper = middle + factor * atr_values[index]
+        basic_lower = middle - factor * atr_values[index]
+        if index == length:
+            upper = basic_upper
+            lower = basic_lower
+            directions[index] = 1
+            continue
+        upper = basic_upper if basic_upper < upper or previous_close > upper else upper
+        lower = basic_lower if basic_lower > lower or previous_close < lower else lower
+        previous_direction = directions[index - 1]
+        if previous_direction < 0 and close > upper:
+            directions[index] = 1
+        elif previous_direction > 0 and close < lower:
+            directions[index] = -1
+        else:
+            directions[index] = previous_direction
+    return atr_values, directions
+
+
+def _chop(bars, length):
+    length = max(2, int(length))
+    if len(bars) < length + 2:
+        return 100.0
+    start = len(bars) - length
+    true_range_sum = 0.0
+    highest = float(bars["high"].iloc[start])
+    lowest = float(bars["low"].iloc[start])
+    for index in range(start, len(bars)):
+        high = float(bars["high"].iloc[index])
+        low = float(bars["low"].iloc[index])
+        previous_close = float(bars["close"].iloc[index - 1])
+        true_range_sum += max(high - low, abs(high - previous_close), abs(low - previous_close))
+        highest = max(highest, high)
+        lowest = min(lowest, low)
+    span = highest - lowest
+    return 100.0 if span <= 0 or true_range_sum <= 0 else 100.0 * math.log10(true_range_sum / span) / math.log10(length)
+
+
+def _number(value):
+    return str(round(float(value), 8))
+
+
+def _reason(direction, entry, stop, target, rr, adx, chop, atr_pct, bar_time):
+    direction_name = "LONG" if direction > 0 else "SHORT"
+    return (
+        "TREND_FLIP|direction=" + direction_name
+        + "|reference_entry=" + _number(entry)
+        + "|stop=" + _number(stop)
+        + "|target=" + _number(target)
+        + "|reward_risk=" + _number(rr)
+        + "|signal_age=0|adx=" + _number(adx)
+        + "|chop=" + _number(chop)
+        + "|atr_pct=" + _number(atr_pct)
+        + "|evidence=supertrend_direction_flip+adx_gate+chop_gate"
+        + "|bar=" + str(bar_time)
+    )
+
+
+def _trade(symbol, direction, entry, stop, target, rr, adx, chop, atr_pct, bar_time, target_pct):
+    amount = float(get_position(symbol).amount or 0.0)
+    if direction > 0 and amount < -1e-12:
+        order_target_percent(symbol, 0.0, reason="TREND_FLIP|close_opposite|direction=LONG")
+        return
+    if direction < 0 and amount > 1e-12:
+        order_target_percent(symbol, 0.0, reason="TREND_FLIP|close_opposite|direction=SHORT")
+        return
+    if (direction > 0 and amount > 1e-12) or (direction < 0 and amount < -1e-12):
+        return
+    side = "long" if direction > 0 else "short"
+    client_id = "trend-flip-" + side + "-" + str(symbol) + "-" + str(bar_time).replace(" ", "T").replace(":", "")
+    entry_reason = _reason(direction, entry, stop, target, rr, adx, chop, atr_pct, bar_time)
+    order_target_percent(
+        symbol,
+        target_pct if direction > 0 else -target_pct,
+        reason=entry_reason,
+        stop_loss_pct=abs(entry - stop) / entry,
+        take_profit_pct=abs(target - entry) / entry,
+        client_order_id=client_id,
+    )
+
+
+def handle_data(context, data):
+    st_atr_length = int(context.params.get("st_atr_length", 10))
+    st_factor = float(context.params.get("st_factor", 3.0))
+    adx_length = int(context.params.get("adx_length", 14))
+    adx_min = float(context.params.get("adx_min", 20.0))
+    chop_length = int(context.params.get("chop_length", 14))
+    chop_max = float(context.params.get("chop_max", 61.8))
+    stop_multiplier = float(context.params.get("stop_multiplier", 2.0))
+    reward_risk = float(context.params.get("reward_risk", 2.0))
+    max_stop_pct = float(context.params.get("max_stop_pct", 0.04))
+    target_pct = float(context.params.get("target_pct", 0.25))
+    count = max(st_atr_length * 4, adx_length * 3, chop_length + 20, 80) + 8
+    for symbol in UNIVERSE:
+        bars = get_history(count, "5m", ["open", "high", "low", "close", "volume"], symbol)
+        if len(bars) < max(st_atr_length + 5, adx_length * 2 + 4, chop_length + 2):
+            continue
+        bar_time = str(bars.index[-1])
+        if g.last_signal.get(symbol) == bar_time:
+            continue
+        atr_values, directions = _supertrend_directions(bars, st_atr_length, st_factor)
+        if len(directions) < 2 or directions[-1] == 0 or directions[-2] == 0 or directions[-1] == directions[-2]:
+            continue
+        direction = directions[-1]
+        adx = _adx(bars, adx_length)
+        chop = _chop(bars, chop_length)
+        if adx < adx_min or chop > chop_max:
+            continue
+        entry = float(bars["close"].iloc[-1])
+        atr = float(atr_values[-1]) if atr_values[-1] > 0 else _atr(bars, st_atr_length)
+        if entry <= 0 or atr <= 0:
+            continue
+        atr_pct = atr / entry
+        stop_pct = min(max_stop_pct, max(0.0001, stop_multiplier * atr_pct))
+        stop = entry * (1.0 - stop_pct) if direction > 0 else entry * (1.0 + stop_pct)
+        target = entry * (1.0 + stop_pct * reward_risk) if direction > 0 else entry * (1.0 - stop_pct * reward_risk)
+        _trade(symbol, direction, entry, stop, target, reward_risk, adx, chop, atr_pct, bar_time, target_pct)
+        g.last_signal[symbol] = bar_time
+$trendflip$, '{"params":[{"name":"st_atr_length","type":"integer","default":10,"min":5,"max":50,"step":1,"labelKey":"strategyV2.params.st_atr_length"},{"name":"st_factor","type":"number","default":3,"min":1,"max":8,"step":0.25,"labelKey":"strategyV2.params.st_factor"},{"name":"adx_length","type":"integer","default":14,"min":5,"max":40,"step":1,"labelKey":"strategyV2.params.adx_length"},{"name":"adx_min","type":"number","default":20,"min":5,"max":50,"step":1,"labelKey":"strategyV2.params.adx_min"},{"name":"chop_length","type":"integer","default":14,"min":5,"max":50,"step":1,"labelKey":"strategyV2.params.chop_length"},{"name":"chop_max","type":"number","default":61.8,"min":40,"max":75,"step":0.5,"labelKey":"strategyV2.params.chop_max"},{"name":"stop_multiplier","type":"number","default":2,"min":0.5,"max":6,"step":0.25,"labelKey":"strategyV2.params.stop_multiplier"},{"name":"reward_risk","type":"number","default":2,"min":0.5,"max":5,"step":0.25,"labelKey":"strategyV2.params.reward_risk"},{"name":"max_stop_pct","type":"percent","default":0.04,"min":0.005,"max":0.15,"step":0.005,"labelKey":"strategyV2.params.max_stop_pct"},{"name":"target_pct","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.target_pct"}]}'::jsonb, '["strategy-v2","cta","crypto","swap","one-way","5m","supertrend","adx","chop"]'::jsonb, 'fund', 'lime', 160, TRUE, '{"source":"system_seed","version":13,"apiVersion":2,"executionMode":"signal","researchStatus":"exploratory_defaults"}'::jsonb, NOW()),
+
+('strategy_v2_sweep_absorption', 'portfolio_strategy', 'Sweep Absorption', '5m confirmed-pivot liquidity sweeps with an OHLCV rejection/absorption proxy and 1m confirmation.', $sweepabsorption$"""Native Strategy API V2 example: confirmed-pivot sweep and absorption proxy."""
+
+# The strategy deliberately labels its OHLCV-only absorption evidence in the
+# order reason.  It does not claim to have exchange taker-buy/taker-sell data.
+
+# @param pivot_length int 3 range=2:10:1
+# @param rvol_lookback int 20 range=5:100:1
+# @param min_relative_volume float 1.5 range=1:5:0.1
+# @param min_sweep_depth_atr float 0.15 range=0.05:2:0.05
+# @param reclaim_threshold float 0.5 range=0.1:1:0.05
+# @param atr_length int 14 range=5:50:1
+# @param atr_stop_buffer float 0.5 range=0.1:3:0.1
+# @param reward_risk float 2.0 range=0.5:5:0.25
+# @param target_pct float 0.25 range=0.05:1:0.05
+
+
+UNIVERSE = [
+    "Crypto:BTC/USDT@swap", "Crypto:ETH/USDT@swap", "Crypto:SOL/USDT@swap",
+    "Crypto:BNB/USDT@swap", "Crypto:XRP/USDT@swap", "Crypto:DOGE/USDT@swap",
+    "Crypto:ADA/USDT@swap", "Crypto:AVAX/USDT@swap", "Crypto:LINK/USDT@swap",
+    "Crypto:BCH/USDT@swap", "Crypto:LTC/USDT@swap", "Crypto:DOT/USDT@swap",
+    "Crypto:SUI/USDT@swap", "Crypto:TRX/USDT@swap", "Crypto:AAVE/USDT@swap",
+    "Crypto:UNI/USDT@swap", "Crypto:NEAR/USDT@swap", "Crypto:APT/USDT@swap",
+    "Crypto:ARB/USDT@swap", "Crypto:OP/USDT@swap", "Crypto:INJ/USDT@swap",
+    "Crypto:ATOM/USDT@swap", "Crypto:FIL/USDT@swap", "Crypto:ETC/USDT@swap",
+    "Crypto:TON/USDT@swap",
+]
+
+
+def initialize(context):
+    g.last_bar = {}
+    g.last_pivot = {}
+    context.set_universe(UNIVERSE)
+    context.subscribe(frequency="5m", fields=["open", "high", "low", "close", "volume"])
+    context.subscribe(frequency="1m", fields=["open", "high", "low", "close", "volume"])
+    context.set_metadata(
+        direction_mode="one_way",
+        strategy_family="SWEEP_ABSORPTION",
+        absorption_evidence="ohlcv_proxy",
+    )
+    context.set_warmup(240)
+    context.allow_leverage(max_leverage=3)
+
+
+def _true_ranges(bars):
+    values = []
+    for index in range(1, len(bars)):
+        high = float(bars["high"].iloc[index])
+        low = float(bars["low"].iloc[index])
+        previous_close = float(bars["close"].iloc[index - 1])
+        values.append(max(high - low, abs(high - previous_close), abs(low - previous_close)))
+    return values
+
+
+def _atr(bars, length):
+    values = _true_ranges(bars)
+    if not values:
+        return 0.0
+    length = max(1, int(length))
+    if len(values) <= length:
+        return sum(values) / len(values)
+    current = sum(values[:length]) / length
+    for value in values[length:]:
+        current = ((current * (length - 1)) + value) / length
+    return current
+
+
+def _latest_confirmed_pivot(bars, length, direction):
+    length = max(2, int(length))
+    latest_candidate = len(bars) - length - 2
+    if latest_candidate < length:
+        return None
+    for index in reversed(range(length, latest_candidate + 1)):
+        left = index - length
+        right = index + length + 1
+        if direction > 0:
+            value = float(bars["high"].iloc[index])
+            window_max = float(bars["high"].iloc[left:right].max())
+            if value >= window_max and value > float(bars["high"].iloc[index - 1]):
+                return index, value, str(bars.index[index])
+        else:
+            value = float(bars["low"].iloc[index])
+            window_min = float(bars["low"].iloc[left:right].min())
+            if value <= window_min and value < float(bars["low"].iloc[index - 1]):
+                return index, value, str(bars.index[index])
+    return None
+
+
+def _relative_volume(bars, lookback):
+    lookback = max(2, int(lookback))
+    if len(bars) < lookback + 1:
+        return 0.0
+    baseline = float(bars["volume"].iloc[-lookback - 1:-1].mean())
+    current = float(bars["volume"].iloc[-1])
+    return current / baseline if baseline > 0 else 0.0
+
+
+def _ohlcv_rejection(bars, direction):
+    high = float(bars["high"].iloc[-1])
+    low = float(bars["low"].iloc[-1])
+    close = float(bars["close"].iloc[-1])
+    span = high - low
+    if span <= 0:
+        return False
+    close_location = (close - low) / span
+    return close_location <= 0.4 if direction < 0 else close_location >= 0.6
+
+
+def _lower_timeframe_rejection(symbol, direction):
+    lower = get_history(5, "1m", ["open", "high", "low", "close", "volume"], symbol)
+    if len(lower) < 3:
+        return False
+    matches = 0
+    for index in range(len(lower)):
+        high = float(lower["high"].iloc[index])
+        low = float(lower["low"].iloc[index])
+        close = float(lower["close"].iloc[index])
+        span = high - low
+        if span <= 0:
+            continue
+        location = (close - low) / span
+        if (direction < 0 and location <= 0.45) or (direction > 0 and location >= 0.55):
+            matches += 1
+    return matches >= max(2, len(lower) // 2)
+
+
+def _number(value):
+    return str(round(float(value), 8))
+
+
+def _reason(direction, entry, stop, target, rr, rvol, depth_atr, pivot, absorption, bar_time):
+    direction_name = "LONG" if direction > 0 else "SHORT"
+    return (
+        "SWEEP_ABSORPTION|direction=" + direction_name
+        + "|reference_entry=" + _number(entry)
+        + "|stop=" + _number(stop)
+        + "|target=" + _number(target)
+        + "|reward_risk=" + _number(rr)
+        + "|signal_age=0|rvol=" + _number(rvol)
+        + "|sweep_depth_atr=" + _number(depth_atr)
+        + "|pivot=" + _number(pivot)
+        + "|absorption_proxy=ohlcv"
+        + ("+1m_rejection" if absorption else "")
+        + "|evidence=confirmed_pivot+sweep_reclaim+elevated_rvol+rejection"
+        + "|bar=" + str(bar_time)
+    )
+
+
+def _trade(symbol, direction, entry, stop, target, rr, rvol, depth_atr, pivot, absorption, bar_time, target_pct):
+    amount = float(get_position(symbol).amount or 0.0)
+    if direction > 0 and amount < -1e-12:
+        order_target_percent(symbol, 0.0, reason="SWEEP_ABSORPTION|close_opposite|direction=LONG")
+        return
+    if direction < 0 and amount > 1e-12:
+        order_target_percent(symbol, 0.0, reason="SWEEP_ABSORPTION|close_opposite|direction=SHORT")
+        return
+    if (direction > 0 and amount > 1e-12) or (direction < 0 and amount < -1e-12):
+        return
+    side = "long" if direction > 0 else "short"
+    client_id = "sweep-absorption-" + side + "-" + str(symbol) + "-" + str(bar_time).replace(" ", "T").replace(":", "")
+    reason = _reason(direction, entry, stop, target, rr, rvol, depth_atr, pivot, absorption, bar_time)
+    order_target_percent(
+        symbol,
+        target_pct if direction > 0 else -target_pct,
+        reason=reason,
+        stop_loss_pct=abs(entry - stop) / entry,
+        take_profit_pct=abs(target - entry) / entry,
+        client_order_id=client_id,
+    )
+
+
+def handle_data(context, data):
+    pivot_length = int(context.params.get("pivot_length", 3))
+    rvol_lookback = int(context.params.get("rvol_lookback", 20))
+    min_relative_volume = float(context.params.get("min_relative_volume", 1.5))
+    min_sweep_depth_atr = float(context.params.get("min_sweep_depth_atr", 0.15))
+    reclaim_threshold = float(context.params.get("reclaim_threshold", 0.5))
+    atr_length = int(context.params.get("atr_length", 14))
+    atr_stop_buffer = float(context.params.get("atr_stop_buffer", 0.5))
+    reward_risk = float(context.params.get("reward_risk", 2.0))
+    target_pct = float(context.params.get("target_pct", 0.25))
+    count = max(atr_length * 3, rvol_lookback + pivot_length * 2 + 8, 80) + 8
+    for symbol in UNIVERSE:
+        bars = get_history(count, "5m", ["open", "high", "low", "close", "volume"], symbol)
+        if len(bars) < max(rvol_lookback + 2, pivot_length * 3 + 4, atr_length + 8):
+            continue
+        bar_time = str(bars.index[-1])
+        if g.last_bar.get(symbol) == bar_time:
+            continue
+        g.last_bar[symbol] = bar_time
+        atr = _atr(bars, atr_length)
+        if atr <= 0:
+            continue
+        rvol = _relative_volume(bars, rvol_lookback)
+        if rvol < min_relative_volume:
+            continue
+        entry = float(bars["close"].iloc[-1])
+        high = float(bars["high"].iloc[-1])
+        low = float(bars["low"].iloc[-1])
+        high_pivot = _latest_confirmed_pivot(bars, pivot_length, 1)
+        low_pivot = _latest_confirmed_pivot(bars, pivot_length, -1)
+        direction = 0
+        pivot = 0.0
+        sweep_depth = 0.0
+        pivot_key = ""
+        if high_pivot is not None:
+            pivot = high_pivot[1]
+            sweep_depth = (high - pivot) / atr
+            reclaim = (pivot - entry) / max(high - pivot, atr * 0.0001)
+            if high > pivot and sweep_depth >= min_sweep_depth_atr and entry < pivot and reclaim >= reclaim_threshold and _ohlcv_rejection(bars, -1):
+                direction = -1
+                pivot_key = high_pivot[2]
+        if direction == 0 and low_pivot is not None:
+            pivot = low_pivot[1]
+            sweep_depth = (pivot - low) / atr
+            reclaim = (entry - pivot) / max(pivot - low, atr * 0.0001)
+            if low < pivot and sweep_depth >= min_sweep_depth_atr and entry > pivot and reclaim >= reclaim_threshold and _ohlcv_rejection(bars, 1):
+                direction = 1
+                pivot_key = low_pivot[2]
+        if direction == 0 or g.last_pivot.get(symbol) == pivot_key:
+            continue
+        lower_absorption = _lower_timeframe_rejection(symbol, direction)
+        stop = high + atr * atr_stop_buffer if direction < 0 else low - atr * atr_stop_buffer
+        target = entry - reward_risk * (stop - entry) if direction < 0 else entry + reward_risk * (entry - stop)
+        _trade(symbol, direction, entry, stop, target, reward_risk, rvol, sweep_depth, pivot, lower_absorption, bar_time, target_pct)
+        g.last_pivot[symbol] = pivot_key
+$sweepabsorption$, '{"params":[{"name":"pivot_length","type":"integer","default":3,"min":2,"max":10,"step":1,"labelKey":"strategyV2.params.pivot_length"},{"name":"rvol_lookback","type":"integer","default":20,"min":5,"max":100,"step":1,"labelKey":"strategyV2.params.rvol_lookback"},{"name":"min_relative_volume","type":"number","default":1.5,"min":1,"max":5,"step":0.1,"labelKey":"strategyV2.params.min_relative_volume"},{"name":"min_sweep_depth_atr","type":"number","default":0.15,"min":0.05,"max":2,"step":0.05,"labelKey":"strategyV2.params.min_sweep_depth_atr"},{"name":"reclaim_threshold","type":"number","default":0.5,"min":0.1,"max":1,"step":0.05,"labelKey":"strategyV2.params.reclaim_threshold"},{"name":"atr_length","type":"integer","default":14,"min":5,"max":50,"step":1,"labelKey":"strategyV2.params.atr_length"},{"name":"atr_stop_buffer","type":"number","default":0.5,"min":0.1,"max":3,"step":0.1,"labelKey":"strategyV2.params.atr_stop_buffer"},{"name":"reward_risk","type":"number","default":2,"min":0.5,"max":5,"step":0.25,"labelKey":"strategyV2.params.reward_risk"},{"name":"target_pct","type":"percent","default":0.25,"min":0.05,"max":1,"step":0.05,"labelKey":"strategyV2.params.target_pct"}]}'::jsonb, '["strategy-v2","cta","crypto","swap","one-way","5m","1m","sweep","absorption-proxy"]'::jsonb, 'radar-chart', 'purple', 170, TRUE, '{"source":"system_seed","version":13,"apiVersion":2,"executionMode":"signal","researchStatus":"exploratory_defaults"}'::jsonb, NOW())
 ON CONFLICT (template_key) DO UPDATE SET
     asset_type = EXCLUDED.asset_type,
     title = EXCLUDED.title,
